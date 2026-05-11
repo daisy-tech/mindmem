@@ -1,0 +1,8 @@
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+pydantic-settings==2.7.0
+mem0ai==2.0.2
+celery==5.4.0
+redis==5.2.1
+openai>=1.90.0
+watchdog==6.0.0

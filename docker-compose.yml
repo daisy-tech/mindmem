@@ -1,0 +1,73 @@
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      - HTTP_PROXY=
+      - HTTPS_PROXY=
+      - ALL_PROXY=
+      - http_proxy=
+      - https_proxy=
+      - all_proxy=
+      - OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+      - QDRANT_HOST=qdrant
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ./backend:/app
+    command: >
+      sh -c "unset NO_PROXY no_proxy ALL_PROXY all_proxy HTTP_PROXY http_proxy HTTPS_PROXY https_proxy && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+    depends_on:
+      - redis
+      - qdrant
+
+  celery:
+    build: ./backend
+    env_file: .env
+    environment:
+      - HTTP_PROXY=
+      - HTTPS_PROXY=
+      - ALL_PROXY=
+      - http_proxy=
+      - https_proxy=
+      - all_proxy=
+      - OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+      - QDRANT_HOST=qdrant
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ./backend:/app
+    command: >
+      sh -c "unset NO_PROXY no_proxy ALL_PROXY all_proxy HTTP_PROXY http_proxy HTTPS_PROXY https_proxy && watchmedo auto-restart --directory=/app --pattern=*.py --recursive -- celery -A celery_worker worker --loglevel=info"
+    depends_on:
+      - redis
+      - qdrant
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    volumes:
+      - qdrant_data:/qdrant/storage
+    ports:
+      - "6333:6333"
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+
+  frontend:
+    build:
+      context: ./frontend
+      target: dev
+    ports:
+      - "5175:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    command: npm run dev -- --host 0.0.0.0
+
+volumes:
+  qdrant_data:
+  redis_data:
