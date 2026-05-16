@@ -18,8 +18,8 @@
     </div>
     <div class="input-area">
       <el-input
+        ref="inputRef"
         v-model="input"
-        :disabled="chatStore.streaming"
         placeholder="输入消息..."
         size="large"
         @keyup.enter="send"
@@ -28,6 +28,7 @@
           <el-button
             type="primary"
             :loading="chatStore.streaming"
+            @mousedown.prevent
             @click="send"
           >
             发送
@@ -40,17 +41,24 @@
 
 <script setup lang="ts">
 import { ref, watch, nextTick } from 'vue'
+import type { ElInput } from 'element-plus'
 import { useChatStore } from '../stores/chat'
 import ChatMessage from '../components/ChatMessage.vue'
 
 const chatStore = useChatStore()
 const input = ref('')
 const msgRef = ref<HTMLDivElement>()
+const inputRef = ref<InstanceType<typeof ElInput>>()
+
+function focusInput() {
+  nextTick(() => inputRef.value?.focus())
+}
 
 function send() {
-  if (!input.value.trim()) return
+  if (!input.value.trim() || chatStore.streaming) return
   chatStore.sendMessage(input.value)
   input.value = ''
+  focusInput()
 }
 
 watch(
@@ -64,7 +72,14 @@ watch(
         msgRef.value.scrollTop = msgRef.value.scrollHeight
       }
     })
-  }
+  },
+)
+
+watch(
+  () => chatStore.streaming,
+  (streaming, wasStreaming) => {
+    if (wasStreaming && !streaming) focusInput()
+  },
 )
 </script>
 

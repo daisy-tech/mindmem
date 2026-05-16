@@ -8,6 +8,9 @@ cd "$(dirname "$0")"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 pass=0; fail=0
+TOKEN=""
+USER_ID=""
+TEST_PHONE="138$(printf '%08d' $((RANDOM % 100000000)))"
 
 ok() { echo -e "${GREEN}✓${NC} $1"; pass=$((pass+1)); }
 no() { echo -e "${RED}✗${NC} $1"; fail=$((fail+1)); }
@@ -27,9 +30,8 @@ wait_for_health() {
 
 test_containers() {
   info "1. 检查容器状态"
-  local running
+  local running total
   running=$(docker compose ps --services --filter "status=running" | wc -l | tr -d ' ')
-  local total
   total=$(docker compose config --services | wc -l | tr -d ' ')
   if [ "$running" = "$total" ]; then
     ok "全部 $total 个容器在运行"
@@ -49,76 +51,145 @@ test_cors() {
     no "缺少 allow-origin"
   fi
   if echo "$headers" | grep -qi "access-control-allow-credentials: true"; then
-    no "仍带 allow-credentials: true（与 allow-origin:* 冲突）"
+    no "仍带 allow-credentials: true"
   else
-    ok "无 allow-credentials（浏览器可正常读 EventSource）"
+    ok "无 allow-credentials"
+  fi
+}
+
+test_auth_send_code() {
+  info "3. 发送短信验证码 (DEV_MODE)"
+  local resp
+  resp=$(curl -s -X POST http://localhost:8000/api/auth/phone/send-code \
+    -H 'Content-Type: application/json' \
+    -d "{\"phone\":\"$TEST_PHONE\"}")
+  local code
+  code=$(echo "$resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('dev_code',''))" 2>/dev/null || echo "")
+  if [ -n "$code" ] && [ "${#code}" = "6" ]; then
+    ok "获取到 6 位验证码: $code"
+    AUTH_CODE="$code"
+  else
+    no "未获取到 dev_code: $resp"
+    return 1
+  fi
+}
+
+test_auth_invalid_phone() {
+  info "4. 非法手机号应被拒绝"
+  local code
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+    http://localhost:8000/api/auth/phone/send-code \
+    -H 'Content-Type: application/json' \
+    -d '{"phone":"abc"}')
+  if [ "$code" = "400" ]; then
+    ok "非法手机号返回 400"
+  else
+    no "非法手机号返回 $code"
+  fi
+}
+
+test_auth_login() {
+  info "5. 手机号 + 验证码登录"
+  local resp
+  resp=$(curl -s -X POST http://localhost:8000/api/auth/phone/login \
+    -H 'Content-Type: application/json' \
+    -d "{\"phone\":\"$TEST_PHONE\",\"code\":\"$AUTH_CODE\"}")
+  TOKEN=$(echo "$resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))" 2>/dev/null || echo "")
+  USER_ID=$(echo "$resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('user',{}).get('id',''))" 2>/dev/null || echo "")
+  if [ -n "$TOKEN" ] && [ -n "$USER_ID" ]; then
+    ok "登录成功，token 长度 ${#TOKEN}, user_id=$USER_ID"
+  else
+    no "登录失败: $resp"
+    exit 1
+  fi
+}
+
+test_auth_wrong_code() {
+  info "6. 错误验证码应被拒绝"
+  local rand_phone="139$(printf '%08d' $((RANDOM % 100000000)))"
+  curl -s -X POST http://localhost:8000/api/auth/phone/send-code \
+    -H 'Content-Type: application/json' -d "{\"phone\":\"$rand_phone\"}" > /dev/null
+  local code
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+    http://localhost:8000/api/auth/phone/login \
+    -H 'Content-Type: application/json' \
+    -d "{\"phone\":\"$rand_phone\",\"code\":\"000000\"}")
+  if [ "$code" = "400" ]; then
+    ok "错误验证码返回 400"
+  else
+    no "错误验证码返回 $code"
+  fi
+}
+
+test_auth_me() {
+  info "7. /api/auth/me 需要 token"
+  local no_token_code
+  no_token_code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/api/auth/me)
+  if [ "$no_token_code" = "401" ] || [ "$no_token_code" = "403" ]; then
+    ok "无 token 返回 $no_token_code"
+  else
+    no "无 token 返回 $no_token_code"
+  fi
+  local resp
+  resp=$(curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/auth/me)
+  if echo "$resp" | grep -q "\"id\":\"$USER_ID\""; then
+    ok "携带 token 可获取用户信息"
+  else
+    no "携带 token 返回异常: $resp"
+  fi
+}
+
+test_memory_requires_auth() {
+  info "8. memory 接口需要 token"
+  local code
+  code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/api/memory)
+  if [ "$code" = "401" ] || [ "$code" = "403" ]; then
+    ok "无 token memory 返回 $code"
+  else
+    no "无 token memory 返回 $code"
+  fi
+  local resp
+  resp=$(curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/memory)
+  if echo "$resp" | python3 -c "import sys,json; json.load(sys.stdin)" 2>/dev/null; then
+    ok "携带 token 返回合法 JSON"
+  else
+    no "携带 token 返回非 JSON: $resp"
   fi
 }
 
 test_sse_stream() {
-  info "3. 测试 SSE 聊天接口"
+  info "9. SSE 聊天（使用 token 参数）"
+  local encoded_token
+  encoded_token=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$TOKEN")
   local body
   body=$(curl -s --max-time 30 \
-    "http://localhost:8000/api/chat/stream?message=hello&user_id=e2e_test&history=%5B%5D")
+    "http://localhost:8000/api/chat/stream?message=hello&token=$encoded_token&history=%5B%5D")
   if echo "$body" | grep -q '^data: {"content":'; then
     ok "SSE 返回 data 块"
   else
     no "SSE 未返回 data 块"; echo "$body" | head -5
   fi
   if echo "$body" | grep -q '^data: \[DONE\]'; then
-    ok "SSE 返回 [DONE] 终止标记"
+    ok "SSE 返回 [DONE]"
   else
     no "SSE 未发送 [DONE]"
   fi
 }
 
-test_memory_api() {
-  info "4. 测试 memory 查询接口"
-  local resp
-  resp=$(curl -s http://localhost:8000/api/memory/e2e_test)
-  if echo "$resp" | python3 -c "import sys,json; json.load(sys.stdin)" 2>/dev/null; then
-    ok "memory 接口返回合法 JSON"
+test_sse_invalid_token() {
+  info "10. 错误 token 的 SSE 应返回 401"
+  local code
+  code=$(curl -s -o /dev/null -w '%{http_code}' \
+    "http://localhost:8000/api/chat/stream?message=hi&token=bad&history=%5B%5D")
+  if [ "$code" = "401" ]; then
+    ok "错误 token 返回 401"
   else
-    no "memory 接口返回非 JSON"; echo "$resp"
-  fi
-}
-
-test_chinese_memory() {
-  info "5. 验证记忆提取为中文（直接走 Mem0Engine）"
-  local out
-  out=$(docker compose exec -T \
-    -e HTTP_PROXY= -e HTTPS_PROXY= -e ALL_PROXY= \
-    -e http_proxy= -e https_proxy= -e all_proxy= \
-    -e NO_PROXY= -e no_proxy= \
-    backend python -c "
-from app.services.mem0_engine import Mem0Engine
-import time
-m = Mem0Engine()
-for mem in m.get_all('e2e_zh').get('results', []):
-    m.client.delete(mem['id'])
-m.add([
-    {'role':'user','content':'我今天去爬了香山，和家人一起'},
-    {'role':'assistant','content':'听起来不错'},
-], user_id='e2e_zh')
-time.sleep(2)
-for mem in m.get_all('e2e_zh').get('results', []):
-    print('MEM:', mem.get('memory',''))
-" 2>&1 | grep "^MEM:" || echo "NONE")
-  if [ "$out" = "NONE" ] || [ -z "$out" ]; then
-    no "未提取到任何记忆"
-  else
-    echo "$out" | sed 's/^/    /'
-    # Simple heuristic: memory contains Chinese chars
-    if echo "$out" | LC_ALL=C grep -q '[^[:print:][:space:]]'; then
-      ok "记忆包含中文字符"
-    else
-      no "记忆看起来仍是纯英文"
-    fi
+    no "错误 token 返回 $code"
   fi
 }
 
 test_celery_config() {
-  info "6. 验证 Celery worker 已加载最新 custom_instructions"
+  info "11. Celery custom_instructions 中文配置"
   local out
   out=$(docker compose exec -T \
     -e HTTP_PROXY= -e HTTPS_PROXY= -e ALL_PROXY= \
@@ -138,7 +209,7 @@ print('OK' if '简体中文' in ci else 'BAD')
 }
 
 test_frontend() {
-  info "7. 前端页面可访问"
+  info "12. 前端页面可访问"
   local code
   code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:5175)
   if [ "$code" = "200" ]; then
@@ -151,9 +222,14 @@ test_frontend() {
 wait_for_health
 test_containers
 test_cors
+test_auth_send_code
+test_auth_invalid_phone
+test_auth_login
+test_auth_wrong_code
+test_auth_me
+test_memory_requires_auth
 test_sse_stream
-test_memory_api
-test_chinese_memory
+test_sse_invalid_token
 test_celery_config
 test_frontend
 

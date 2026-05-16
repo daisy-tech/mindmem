@@ -1,16 +1,22 @@
+import logging
 import os
 import json
 
 import openai
-from fastapi import APIRouter, Query
+
+logger = logging.getLogger(__name__)
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.services.mem0_engine import Mem0Engine
+from app.auth import get_current_user, get_user_from_token
+from app.db import get_db
+from app.models.user import User
+from app.services.mem0_engine import get_mem0
 from celery_worker import extract_and_store_memory
 
 router = APIRouter()
-mem0 = Mem0Engine()
 
 DASHSCOPE_BASE_URL = os.getenv(
     "OPENAI_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"
@@ -25,7 +31,6 @@ class ChatMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str
-    user_id: str
     history: list[ChatMessage] = []
 
 
@@ -54,16 +59,23 @@ def _build_system_prompt(memory_text: str) -> str:
 - 不要用夸张的语气词（"啊！""哇！""天呐！"），保持成熟稳重"""
 
 
-@router.post("/stream")
-async def chat_stream(req: ChatRequest):
-    memories = mem0.search(req.message, user_id=req.user_id, limit=5)
-    memory_text = "\n".join(
-        f"- {m['memory']}" for m in memories.get("results", [])
-    )
+def _search_memory_text(user_id: str, message: str) -> str:
+    try:
+        memories = get_mem0().search(message, user_id=user_id, limit=5)
+        return "\n".join(
+            f"- {m['memory']}" for m in memories.get("results", [])
+        )
+    except Exception as e:
+        logger.warning("mem0 search failed, continuing without memory: %s", e)
+        return ""
+
+
+def _stream_response(user_id: str, message: str, history: list[ChatMessage]):
+    memory_text = _search_memory_text(user_id, message)
 
     messages = [{"role": "system", "content": _build_system_prompt(memory_text)}]
-    messages.extend({"role": m.role, "content": m.content} for m in req.history)
-    messages.append({"role": "user", "content": req.message})
+    messages.extend({"role": m.role, "content": m.content} for m in history)
+    messages.append({"role": "user", "content": message})
 
     client = openai.AsyncOpenAI(
         api_key=os.getenv("OPENAI_API_KEY"),
@@ -89,23 +101,29 @@ async def chat_stream(req: ChatRequest):
             return
 
         conversation = messages + [{"role": "assistant", "content": full_response}]
-        extract_and_store_memory.delay(req.user_id, conversation)
+        extract_and_store_memory.delay(user_id, conversation)
 
     return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+@router.post("/stream")
+async def chat_stream(req: ChatRequest, user: User = Depends(get_current_user)):
+    return _stream_response(user.id, req.message, req.history)
 
 
 @router.get("/stream")
 async def chat_stream_get(
     message: str = Query(...),
-    user_id: str = Query(...),
+    token: str = Query(..., description="JWT access token (EventSource 不支持自定义 header)"),
     history: str = Query("[]"),
+    db: AsyncSession = Depends(get_db),
 ):
-    """GET 版本，方便 EventSource 调用"""
+    user = await get_user_from_token(token, db)
+    if not user:
+        raise HTTPException(401, "token 无效或已过期")
     try:
         hist = json.loads(history)
     except json.JSONDecodeError:
         hist = []
     parsed_history = [ChatMessage(**m) for m in hist]
-    return await chat_stream(
-        ChatRequest(message=message, user_id=user_id, history=parsed_history)
-    )
+    return _stream_response(user.id, message, parsed_history)

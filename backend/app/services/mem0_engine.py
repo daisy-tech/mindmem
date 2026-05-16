@@ -1,4 +1,6 @@
 import os
+from functools import lru_cache
+
 from mem0 import Memory
 
 
@@ -43,3 +45,8 @@ class Mem0Engine:
 
     def delete(self, memory_id: str, user_id: str):
         return self.client.delete(memory_id)
+
+
+@lru_cache(maxsize=1)
+def get_mem0() -> Mem0Engine:
+    return Mem0Engine()

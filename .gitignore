@@ -16,6 +16,14 @@ dist/
 # Docker volumes mount artifacts
 .docker/
 
+# Local dev (no Docker)
+.tools/
+backend/.venv/
+backend/data/
+frontend/data/
+qdrant_storage/
+.qdrant-initialized
+
 # OS
 .DS_Store
 Thumbs.db

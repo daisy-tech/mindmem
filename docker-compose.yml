@@ -14,8 +14,12 @@ services:
       - OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
       - QDRANT_HOST=qdrant
       - REDIS_URL=redis://redis:6379/0
+      - USER_DB_PATH=/app/data/memobot.db
+      - JWT_SECRET=${JWT_SECRET:-memobot-dev-secret-change-me}
+      - DEV_MODE=${DEV_MODE:-true}
     volumes:
       - ./backend:/app
+      - memobot_data:/app/data
     command: >
       sh -c "unset NO_PROXY no_proxy ALL_PROXY all_proxy HTTP_PROXY http_proxy HTTPS_PROXY https_proxy && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
     depends_on:
@@ -71,3 +75,4 @@ services:
 volumes:
   qdrant_data:
   redis_data:
+  memobot_data:

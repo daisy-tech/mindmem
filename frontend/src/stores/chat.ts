@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
+import { useAuthStore } from './auth'
 
 export interface Message {
   role: 'user' | 'assistant' | 'system'
@@ -11,13 +12,14 @@ const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000'
 export const useChatStore = defineStore('chat', () => {
   const messages = ref<Message[]>([])
   const streaming = ref(false)
-  const userId = ref('user_001')
 
   async function sendMessage(content: string) {
     if (!content.trim() || streaming.value) return
+    const auth = useAuthStore()
+    if (!auth.token) return
+
     streaming.value = true
     messages.value.push({ role: 'user', content })
-
     messages.value.push({ role: 'assistant', content: '' })
     const assistantIdx = messages.value.length - 1
 
@@ -28,7 +30,7 @@ export const useChatStore = defineStore('chat', () => {
 
     const params = new URLSearchParams({
       message: content,
-      user_id: userId.value,
+      token: auth.token,
       history: JSON.stringify(history),
     })
 
@@ -66,7 +68,6 @@ export const useChatStore = defineStore('chat', () => {
   return {
     messages,
     streaming,
-    userId,
     sendMessage,
     clearChat,
   }

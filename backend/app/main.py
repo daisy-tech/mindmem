@@ -1,8 +1,10 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.routers import chat, memory, auth
 
-app = FastAPI(title="MemoBot API", version="0.1.0")
+from app.db import init_db
+from app.routers import auth, chat, memory
+
+app = FastAPI(title="MemoBot API", version="0.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -11,6 +13,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+async def _startup():
+    await init_db()
+
 
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
 app.include_router(chat.router, prefix="/api/chat", tags=["chat"])

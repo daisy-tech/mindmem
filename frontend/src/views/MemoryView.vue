@@ -20,7 +20,7 @@
             type="danger"
             size="small"
             text
-            @click="memoryStore.deleteMemory(userId, mem.id)"
+            @click="memoryStore.deleteMemory(mem.id)"
           >
             删除
           </el-button>
@@ -35,10 +35,9 @@ import { onMounted, onActivated } from 'vue'
 import { useMemoryStore } from '../stores/memory'
 
 const memoryStore = useMemoryStore()
-const userId = 'user_001'
 
 function refresh() {
-  memoryStore.fetchMemories(userId)
+  memoryStore.fetchMemories()
 }
 
 function formatDate(d: string) {
