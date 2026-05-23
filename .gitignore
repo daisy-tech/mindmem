@@ -32,3 +32,8 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# macOS AppleDouble（NFS/SMB 共享目录常见）
+._*
+# Celery Beat 运行时文件
+backend/celerybeat-schedule
