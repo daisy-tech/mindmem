@@ -1,6 +1,6 @@
 # MindMem 1.0 技术设计文档
 
-> 版本：1.0 | 日期：2026-05-23
+> 版本：1.1 | 日期：2026-05-24
 
 ---
 
@@ -46,7 +46,7 @@
 
 | 服务 | 镜像/框架 | 端口 | 职责 |
 |------|---------|------|------|
-| backend | FastAPI (Python 3.11) | 8000 | API 服务 |
+| backend | FastAPI (Python 3.12) | 8000 | API 服务 |
 | celery | Celery 5 | - | 异步记忆提取 |
 | celery-beat | Celery Beat | - | 定时任务（记忆衰减） |
 | qdrant | qdrant/qdrant | 6333 | 向量数据库 |
@@ -63,9 +63,15 @@
 - **格式**：自然语言片段，带 user_id 过滤
 - **检索**：语义相似度搜索（top_k=500）
 - **去重策略**：
-  - 相似度 > 0.92 → 跳过
-  - 0.78 ~ 0.92 → 更新已有记忆
-  - < 0.78 → 新增
+  - 相似度 ≥0.82 → 跳过
+  - 0.62 ~ 0.82 → LLM 合并已有记忆
+  - <0.62 → 新增
+- **写入策略**：
+  - `extract_and_store_memory` 先调用 `qwen-plus` 提取候选事实
+  - 候选事实写入 Mem0 时使用 `infer=False`，避免 Mem0 再次抽取/改写
+  - LLM 合并使用 `_llm_merge()`，输出一句干净事实，不做字符串拼接
+  - 写入前通过 `_strip_subject_prefix()` 去掉"用户dxj"/"dxj的"/"他"等主语前缀
+  - 候选提取失败时跳过写入，不降级为 Mem0 直接抽取
 - **注入 Prompt**：根据当前对话语义检索 top-N 相关记忆
 
 ### 2.2 L2 用户画像（User Profile）
@@ -88,7 +94,15 @@
   ```
 - **提取**：Celery 任务 `extract_and_update_profile`，LLM（qwen-plus）解析对话
 - **冲突处理**：三类字段策略（见下节）
-- **审计日志**：`memory_audit_logs` 表，记录每次字段变更
+- **审计日志**：`memory_audit_log` 表，记录每次字段变更
+- **路径防御**：
+  - `_ALLOWED_FIELD_PATHS` 白名单限制允许写入的叶子字段
+  - `_coerce_fact_path()` 规整 LLM 偶发非法路径，如 `social.relationships.妻子`
+  - `social.family_structure` 已废弃，写入时自动迁移到 `social.relationships`
+- **强类型与自愈**：
+  - `basic.age` 只允许整数年龄
+  - `"83年"`、`83`、`1983` 等出生年份表达归一化到 `basic.birthday`
+  - `_heal_profile()` 修复历史脏数据，包括 age/birthday、relationships 外层污染和 family_structure 残留
 
 **冲突处理策略**
 
@@ -101,12 +115,21 @@ ACCUMULATIVE_FIELDS = {
 }
 
 OVERRIDE_FIELDS = {
-    "basic.name", "basic.age", "basic.location",
-    "basic.gender", "basic.birthday",
+    "basic.name", "basic.birthday", "basic.location",
+    "basic.gender",
     "career.job_title", "career.industry",
 }
 # 其余字段为 merge 策略（LLM 辅助深度合并）
 ```
+
+**关键归一化函数**
+
+| 函数 | 作用 |
+|------|------|
+| `_coerce_fact_path` | 将非法 dimension_path 规整到合法叶子字段，或丢弃 |
+| `_normalize_relationships` | 去掉无效 key，修复 `via=用户/我/本人`，校验 via 是否指向真实节点 |
+| `_smart_merge_relationships` | 合并社会关系时保留更详细描述，避免短文本覆盖长文本 |
+| `_heal_profile` | 修复历史脏画像，供提取流程和运维脚本复用 |
 
 ### 2.3 L3 事件记忆（Event Memory）
 
@@ -124,11 +147,19 @@ OVERRIDE_FIELDS = {
 - **结构示例**：
   ```json
   {
-    "妻子": {"value": "小明", "relation": "配偶"},
-    "同事_张三": {"value": "张三", "relation": "同事", "note": "技术 leader"}
+    "妻子": "配偶，和我一样大，全职在家带小孩",
+    "儿子": "9岁半",
+    "小孙孙": {"rel": "儿子的同学，爱听相声", "via": "儿子"},
+    "邻居老爷爷": "邻居，80岁，养狗叫可乐"
   }
   ```
 - **前端渲染**：SVG 树状图，以用户为根节点
+- **关系规则**：
+  - 直系关系：value 为字符串
+  - 间接关系：value 为 `{ "rel": "...", "via": "中间人名" }`
+  - `via` 必须指向 relationships 中另一个真实存在的 key
+  - `via` 指向用户本人或不存在节点时，后端归一化为直系关系
+  - 前端兼容对象、数组和 JSON 字符串等历史格式
 
 ---
 
@@ -139,28 +170,27 @@ OVERRIDE_FIELDS = {
 **users**
 ```sql
 id          TEXT PK   -- UUID
-username    TEXT UNIQUE
-password    TEXT       -- bcrypt hashed
-created_at  TEXT
+phone       TEXT UNIQUE INDEX
+nickname    TEXT
+created_at  DATETIME
 ```
 
 **user_profiles**
 ```sql
-id          TEXT PK
-user_id     TEXT FK → users.id
+user_id      TEXT PK
 profile_json TEXT     -- 嵌套画像 JSON
-created_at  TEXT
-updated_at  TEXT
+last_updated DATETIME
 ```
 
-**memory_audit_logs**
+**memory_audit_log**
 ```sql
 id          INTEGER PK AUTOINCREMENT
 user_id     TEXT
-field_path  TEXT       -- e.g. "career.skills"
+dimension_path TEXT    -- e.g. "career.skills"
 old_value   TEXT
 new_value   TEXT
 action      TEXT       -- added/appended/replaced/merged/confirmed/replaced_lower_conf
+session_id  TEXT
 created_at  TEXT
 ```
 
@@ -199,9 +229,9 @@ updated_at  TEXT
 ### 4.1 认证
 
 ```
-POST /api/auth/register   -- 注册
-POST /api/auth/login      -- 登录，返回 JWT token
-GET  /api/auth/me         -- 获取当前用户
+POST /api/auth/phone/send-code -- 发送手机号验证码（DEV_MODE 下返回 dev_code）
+POST /api/auth/phone/login     -- 手机号 + 验证码登录，返回 JWT token
+GET  /api/auth/me              -- 获取当前用户
 ```
 
 ### 4.2 对话
@@ -210,26 +240,25 @@ GET  /api/auth/me         -- 获取当前用户
 POST /api/chat/stream     -- 流式对话（SSE）
   Body: { message: string, history: [{role, content}] }
   Events:
-    data: {"type": "text", "content": "..."}
-    data: {"type": "prompt", "content": "..."}  // 激活的记忆 prompt
-    data: {"type": "done"}
+    data: {"type": "prompt", "memories": [...], "system": "..."}  // 激活的记忆 prompt
+    data: {"type": "content", "content": "..."}
+    data: [DONE]
 ```
 
 ### 4.3 记忆管理
 
 ```
-GET    /api/memories             -- 获取所有情节记忆
-POST   /api/memories/search      -- 语义搜索记忆
-DELETE /api/memories/{memory_id} -- 删除记忆
-POST   /api/memories/import      -- 批量导入 JSON
-GET    /api/memories/export      -- 导出所有记忆 JSON
+GET    /api/memory             -- 获取所有情节记忆
+DELETE /api/memory/{memory_id} -- 删除记忆
+POST   /api/memory/import      -- 批量导入文本记忆
 ```
 
 ### 4.4 用户画像
 
 ```
 GET    /api/profile              -- 获取用户画像
-POST   /api/profile/refresh      -- 手动触发画像刷新
+POST   /api/profile/field        -- 手动设置字段（运维/调试）
+DELETE /api/profile/field        -- 删除字段
 GET    /api/profile/conflict-log -- 自动处理记录（分页）
 ```
 
@@ -274,6 +303,19 @@ StreamingResponse 完成
 
 ---
 
+### 5.3 记忆质量治理脚本
+
+| 脚本 | 默认模型 | 写库方式 | 用途 |
+|------|----------|----------|------|
+| `scripts/eval_memory.py` | - | 只读 | 读取 SQLite + Mem0/Qdrant，输出四层记忆质量报告 |
+| `scripts/fix_dirty_profile.py` | - | 直接写 SQLite | 修复历史画像脏数据（age/birthday、family_structure、relationships 错位） |
+| `scripts/compact_memories.py` | qwen-max | dry-run，`--apply` 后写入 Mem0 | 压缩情节记忆，删除重复和元数据噪音 |
+| `scripts/clean_relationships.py` | qwen-max | dry-run，`--apply` 后写入 SQLite | 语义清洗社会关系，合并重复 key，补回明确细节 |
+
+脚本均以 dry-run 优先，关键清洗任务默认使用 `qwen-max`，降低 LLM 推断和编造概率；高频在线提取仍使用 `qwen-plus` 控制成本。
+
+---
+
 ## 6. LLM 使用策略
 
 | 场景 | 模型 | 原因 |
@@ -281,7 +323,11 @@ StreamingResponse 完成
 | 对话生成 | qwen-max | 语言质量要求高，需要自然表达 |
 | 画像提取 | qwen-plus | 结构化 JSON 输出，质量优先（关系/事件抽取易出错） |
 | 事件提取 | qwen-plus | 结构化 JSON 输出，质量优先 |
-| 对话标题生成 | qwen-plus | 简单摘要任务，统一模型简化运维 |
+| 情节记忆候选提取 | qwen-plus | 高频任务，质量和成本平衡 |
+| 情节记忆合并 | qwen-plus | 高频但输入短，用于合并相似记忆 |
+| 手动记忆压缩 | qwen-max | 低频关键清洗，质量优先 |
+| 手动社会关系清洗 | qwen-max | 低频关键清洗，降低推断/编造概率 |
+| 对话标题生成 | 规则截取首条用户消息 | 当前实现未单独调用 LLM |
 
 ---
 

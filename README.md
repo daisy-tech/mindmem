@@ -10,6 +10,7 @@
 - **智能伴侣**：qwen-max 驱动，温柔知性，对话自然克制
 - **记忆画廊**：可视化管理所有记忆层，支持导入/导出
 - **自动冲突处理**：画像字段智能合并，附审计日志
+- **记忆质量治理**：情节记忆去重压缩、画像字段归一化、社会关系清洗
 - **历史对话**：会话自动保存，支持随时回顾
 - **Prompt 透明**：每次回复可查看激活了哪些记忆
 
@@ -19,7 +20,7 @@
 
 ### 前置条件
 
-- Docker Desktop（已启动）
+- Docker / Docker Compose
 - 阿里云 DashScope API Key（支持 qwen 系列）
 
 ### 1. 获取代码
@@ -42,10 +43,10 @@ OPENAI_API_KEY=sk-xxxxxxxxxxxx     # 必填：DashScope API Key
 JWT_SECRET=your-secret-key-here    # 建议修改：JWT 签名密钥
 ```
 
-### 3. 启动服务
+### 3. 启动服务（Docker Compose 推荐）
 
 ```bash
-./start-local.sh
+docker compose up -d --build
 ```
 
 等待所有容器启动后，访问 [http://localhost:5175](http://localhost:5175)
@@ -53,8 +54,10 @@ JWT_SECRET=your-secret-key-here    # 建议修改：JWT 签名密钥
 ### 4. 停止服务
 
 ```bash
-./stop-local.sh
+docker compose down
 ```
+
+> `start-local.sh` / `stop-local.sh` 主要用于 macOS 本地非 Docker 开发；ECS 或 Linux 环境建议使用 Docker Compose。
 
 ---
 
@@ -79,6 +82,7 @@ mindmem/
 │   │       ├── mem0_engine.py      # Mem0 封装
 │   │       ├── profile_engine.py   # 画像提取 + 冲突处理
 │   │       └── event_engine.py     # 事件提取 + 格式化
+│   ├── scripts/              # 记忆评测/修复/清洗工具
 │   └── celery_worker.py     # 异步任务（记忆/画像/事件提取）
 ├── frontend/
 │   └── src/
@@ -114,7 +118,7 @@ mindmem/
 ## 技术栈
 
 **后端**
-- FastAPI (Python 3.11, async)
+- FastAPI (Python 3.12, async)
 - SQLAlchemy 2 + SQLite
 - Mem0 + Qdrant（向量存储）
 - Celery 5 + Redis（异步任务）
@@ -136,13 +140,40 @@ mindmem/
 ## 记忆架构
 
 ```
-L1 情节记忆  →  Mem0 + Qdrant  →  自然语言片段，语义检索
-L2 用户画像  →  SQLite JSON    →  结构化属性，置信度打分
+L1 情节记忆  →  候选事实提取 + 去重/合并 + Mem0/Qdrant
+L2 用户画像  →  SQLite JSON + 字段白名单 + 强类型归一化
 L3 事件记忆  →  SQLite + Qdrant →  结构化事件，时间索引
-L4 社会关系  →  嵌套在 L2 内   →  人际关系图谱
+L4 社会关系  →  嵌套在 L2 内，统一 social.relationships，人际关系图谱
 ```
 
 每次对话结束后，Celery 异步任务自动更新四层记忆，不阻塞对话响应。
+
+### 记忆质量治理
+
+- 情节记忆写入 Mem0 时使用 `infer=false`，避免二次抽取产生元数据噪音
+- 相似度 ≥0.82 跳过，0.62-0.82 使用 LLM 合并，<0.62 新增
+- 画像字段使用白名单，非法路径自动归一化或丢弃
+- `social.family_structure` 已废弃，所有人际关系统一进入 `social.relationships`
+- `basic.age` / `basic.birthday` 写入前做强类型校验，例如 `"83年"` 会迁移为 `birthday="1983"`
+- 社会关系中 `via` 必须指向已存在的人物 key，否则自动降级为直系关系
+
+### 运维脚本
+
+```bash
+# 一键评测四层记忆
+docker compose exec backend python3 scripts/eval_memory.py
+
+# 修复历史脏画像
+docker compose exec backend python3 scripts/fix_dirty_profile.py
+
+# 压缩冗余情节记忆（默认 dry-run，加 --apply 才写库）
+docker compose exec backend python3 scripts/compact_memories.py <phone>
+docker compose exec backend python3 scripts/compact_memories.py <phone> --apply
+
+# 清洗社会关系（默认 qwen-max，支持 --model）
+docker compose exec backend python3 scripts/clean_relationships.py <phone>
+docker compose exec backend python3 scripts/clean_relationships.py <phone> --apply
+```
 
 ---
 
