@@ -399,14 +399,53 @@ watch(activeTab, (tab) => {
 })
 
 // ───── 社会关系图逻辑 ─────
-const socialRelationships = computed<Record<string, unknown> | null>(() => {
-  const rel = profileStore.profile.profile?.['social']?.['relationships']
-  if (!rel) return null
-  const val = (rel as { value?: unknown }).value
-  if (val && typeof val === 'object' && !Array.isArray(val)) {
+/** 将 LLM 可能返回的多种 relationships 格式统一为关系图所需的 { 人名: 关系 } 对象 */
+function normalizeRelationships(raw: unknown): Record<string, unknown> | null {
+  if (raw == null || raw === '') return null
+
+  let val: unknown = raw
+  if (typeof raw === 'object' && !Array.isArray(raw) && 'value' in (raw as object)) {
+    val = (raw as { value: unknown }).value
+  }
+
+  if (typeof val === 'string') {
+    const trimmed = val.trim()
+    if (!trimmed) return null
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      try {
+        return normalizeRelationships(JSON.parse(trimmed))
+      } catch {
+        return null
+      }
+    }
+    return null
+  }
+
+  if (Array.isArray(val)) {
+    const result: Record<string, unknown> = {}
+    for (const item of val) {
+      if (typeof item === 'string') {
+        result[item] = '关系未知'
+      } else if (item && typeof item === 'object') {
+        const obj = item as Record<string, unknown>
+        const name = obj.name ?? obj.person ?? obj.key ?? obj.who
+        const rel = obj.rel ?? obj.relation ?? obj.relationship ?? obj.desc ?? obj.value
+        if (name) result[String(name)] = rel ?? '关系未知'
+      }
+    }
+    return Object.keys(result).length ? result : null
+  }
+
+  if (val && typeof val === 'object') {
     return val as Record<string, unknown>
   }
+
   return null
+}
+
+const socialRelationships = computed<Record<string, unknown> | null>(() => {
+  const rel = profileStore.profile.profile?.['social']?.['relationships']
+  return normalizeRelationships(rel)
 })
 
 const selfName = computed<string>(() => {

@@ -34,8 +34,12 @@ class Mem0Engine:
         }
         self.client = Memory.from_config(config)
 
-    def add(self, messages: list, user_id: str):
-        return self.client.add(messages, user_id=user_id)
+    def add(self, messages, user_id: str, infer: bool = True):
+        """添加记忆。
+        infer=True (默认): Mem0 会用 LLM 再次抽取/改写文本
+        infer=False: 把原始文本直接作为一条记忆写入（适合上游已抽取过）
+        """
+        return self.client.add(messages, user_id=user_id, infer=infer)
 
     def search(self, query: str, user_id: str, limit: int = 5):
         return self.client.search(query, top_k=limit, filters={"user_id": user_id})

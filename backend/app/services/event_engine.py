@@ -91,7 +91,7 @@ def extract_events_from_conversation(messages: list, current_date: str | None = 
     )
     try:
         resp = client.chat.completions.create(
-            model=os.getenv("EXTRACT_MODEL", os.getenv("CHAT_MODEL", "qwen-turbo")),
+            model=os.getenv("EXTRACT_MODEL", os.getenv("CHAT_MODEL", "qwen-plus")),
             messages=[
                 {"role": "system", "content": EXTRACT_PROMPT.format(
                     current_date=current_date, history=history_text

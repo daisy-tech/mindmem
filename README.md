@@ -105,7 +105,7 @@ mindmem/
 | `OPENAI_API_KEY` | - | DashScope API Key（必填） |
 | `OPENAI_BASE_URL` | dashscope.aliyuncs.com/... | API 接入点 |
 | `CHAT_MODEL` | qwen-max | 对话模型 |
-| `EXTRACT_MODEL` | qwen-turbo | 记忆提取模型 |
+| `EXTRACT_MODEL` | qwen-plus | 记忆提取模型 |
 | `JWT_SECRET` | memobot-dev-secret | JWT 密钥（生产环境必须修改） |
 | `DEV_MODE` | true | 开发模式 |
 

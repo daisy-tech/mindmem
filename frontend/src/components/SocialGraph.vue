@@ -119,6 +119,28 @@ function shortLabel(rel: string): string {
   return parts[0].slice(0, 5)
 }
 
+function relText(val: unknown): string {
+  if (typeof val === 'string') return val
+  if (val && typeof val === 'object') {
+    const obj = val as Record<string, unknown>
+    const rel = obj.rel ?? obj.relation ?? obj.relationship ?? obj.desc
+    if (rel != null) return String(rel)
+    return ''
+  }
+  if (val == null) return ''
+  return String(val)
+}
+
+// LLM 偶尔把 via 写成"用户/我/本人"等指向自己的词，这种应视为直系关系
+const SELF_ALIASES = new Set(['用户', '我', '本人', '自己', 'self', 'user', 'me'])
+
+function isIndirectRel(val: unknown): val is { rel: string; via: string } {
+  if (!val || typeof val !== 'object') return false
+  const via = (val as Record<string, unknown>).via
+  if (via == null || via === '') return false
+  return !SELF_ALIASES.has(String(via).trim().toLowerCase())
+}
+
 interface RelNode {
   id: string
   name: string
@@ -138,11 +160,11 @@ const level1Nodes = computed<RelNode[]>(() => {
 
   const direct = Object.entries(rels).filter(([name, val]) => {
     if (name === '未知') return false
-    return typeof val === 'string' || (typeof val === 'object' && !(val as any).via)
+    return !isIndirectRel(val)
   })
   const total = direct.length
   return direct.map(([name, val], i) => {
-    const rel = typeof val === 'string' ? val : String((val as any)?.rel ?? '')
+    const rel = relText(val)
     const angle = (2 * Math.PI * i) / total - Math.PI / 2
     return {
       id: name,
@@ -165,11 +187,12 @@ const level2Nodes = computed<RelNode[]>(() => {
 
   const indirect = Object.entries(rels).filter(([name, val]) => {
     if (name === '未知') return false
-    return typeof val === 'object' && (val as any).via
+    return isIndirectRel(val)
   })
 
   return indirect.map(([name, val]) => {
-    const v = val as { rel: string; via: string }
+    const v = val as { rel?: string; relation?: string; via: string }
+    const relStr = relText(v)
     const parent = level1Nodes.value.find(n => n.id === v.via)
     // 找父节点的角度，子节点沿同方向但更远
     let pAngle = Math.atan2((parent?.y ?? cy) - cy, (parent?.x ?? cx) - cx)
@@ -184,9 +207,9 @@ const level2Nodes = computed<RelNode[]>(() => {
     return {
       id: name,
       name,
-      relFull: v.rel,
-      relLabel: shortLabel(v.rel),
-      color: getColor(v.rel),
+      relFull: relStr,
+      relLabel: shortLabel(relStr),
+      color: getColor(relStr),
       level: 2,
       x: cx + R2 * Math.cos(childAngle),
       y: cy + R2 * Math.sin(childAngle),

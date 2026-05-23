@@ -39,7 +39,7 @@ services:
       - all_proxy=
       - OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
       - CHAT_MODEL=qwen-max
-      - EXTRACT_MODEL=qwen-turbo
+      - EXTRACT_MODEL=qwen-plus
       - QDRANT_HOST=qdrant
       - REDIS_URL=redis://redis:6379/0
       - USER_DB_PATH=/app/data/memobot.db
@@ -78,7 +78,7 @@ services:
       - all_proxy=
       - OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
       - CHAT_MODEL=qwen-max
-      - EXTRACT_MODEL=qwen-turbo
+      - EXTRACT_MODEL=qwen-plus
       - QDRANT_HOST=qdrant
       - REDIS_URL=redis://redis:6379/0
       - USER_DB_PATH=/app/data/memobot.db

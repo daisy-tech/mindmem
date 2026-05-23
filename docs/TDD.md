@@ -86,7 +86,7 @@
     }
   }
   ```
-- **提取**：Celery 任务 `extract_and_update_profile`，LLM（qwen-turbo）解析对话
+- **提取**：Celery 任务 `extract_and_update_profile`，LLM（qwen-plus）解析对话
 - **冲突处理**：三类字段策略（见下节）
 - **审计日志**：`memory_audit_logs` 表，记录每次字段变更
 
@@ -279,9 +279,9 @@ StreamingResponse 完成
 | 场景 | 模型 | 原因 |
 |------|------|------|
 | 对话生成 | qwen-max | 语言质量要求高，需要自然表达 |
-| 画像提取 | qwen-turbo | 结构化 JSON 输出，速度优先 |
-| 事件提取 | qwen-turbo | 结构化 JSON 输出，成本优先 |
-| 对话标题生成 | qwen-turbo | 简单摘要任务 |
+| 画像提取 | qwen-plus | 结构化 JSON 输出，质量优先（关系/事件抽取易出错） |
+| 事件提取 | qwen-plus | 结构化 JSON 输出，质量优先 |
+| 对话标题生成 | qwen-plus | 简单摘要任务，统一模型简化运维 |
 
 ---
 
@@ -339,7 +339,7 @@ frontend ──→ backend ──→ qdrant
 | OPENAI_API_KEY | - | DashScope API Key（必填） |
 | OPENAI_BASE_URL | dashscope.aliyuncs.com | API 接入点 |
 | CHAT_MODEL | qwen-max | 对话模型 |
-| EXTRACT_MODEL | qwen-turbo | 提取模型 |
+| EXTRACT_MODEL | qwen-plus | 提取模型 |
 | JWT_SECRET | memobot-dev-secret | JWT 签名密钥（生产必须修改） |
 | REDIS_URL | redis://redis:6379/0 | Celery Broker |
 | QDRANT_HOST | qdrant | Qdrant 服务地址 |

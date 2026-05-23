@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 
 import openai
 from celery import Celery
@@ -43,14 +44,70 @@ def _get_db_path() -> str:
 # ──────────────────────────────────────────────
 
 CANDIDATE_EXTRACT_PROMPT = """\
-从以下用户消息中提炼出 1-5 条独立的事实或事件，每条用一句简洁的中文描述。
-只提取用户消息中明确表达的内容，不要推断。
-只输出 JSON 字符串数组，不要有其他文字。示例：["用户每周和儿子打乒乓球", "儿子9岁半"]
-若无可提取内容则输出 []。"""
+你是一个事实提取器。从用户消息中提炼 0-5 条相互独立的"事实"，每条用一句简洁中文描述。
 
-# 相似度阈值
-SIM_SKIP = 0.92    # 高于此：内容几乎相同，直接跳过
-SIM_UPDATE = 0.78  # 高于此：同话题有新信息，更新旧记忆
+严格规则：
+1. 只提取用户消息中明确表达的内容，不要推断、不要泛化、不要总结情绪。
+2. 每条事实是一个客观陈述句，**不要带主语**——记忆本来就是属于这位用户的，不需要再重复
+   ❌ "用户dxj定居北京昌平"
+   ❌ "dxj定居北京昌平"
+   ❌ "他定居北京昌平"
+   ✅ "定居北京昌平"
+3. 禁止以下元数据噪音：
+   - 任何人名/用户名作为主语开头
+   - "于2026年5月23日" 等具体日期
+   - "该信息于...向MemoBot透露"、"向系统表达"
+   - "反映了..."、"表明..."、"体现出..."
+4. 多个相关小事实尽量合并成一条更具体的陈述（如"儿子9岁半，养了两只小鹏：小孙孙、小魏魏"）。
+
+正例：
+  ["定居北京昌平，每天去海淀上班，做IT", "儿子9岁半", "妻子全职在家带孩子"]
+反例（绝对禁止）：
+  ["用户dxj是IT从业者，该信息于2026年5月23日向MemoBot透露"]
+  ["dxj的邻居80岁"]
+  ["用户表达了对北京生活压力很大的感受"]
+
+只输出 JSON 字符串数组，不要有其他文字。无可提取内容则输出 []。"""
+
+MERGE_MEMORY_PROMPT = """\
+你需要把"旧记忆"和"新增信息"融合成一条简洁、完整的中文记忆。
+
+规则：
+- 保留旧记忆中具体的细节（人名、年龄、地点、习惯等），不能丢失
+- 新增信息补充进来或修正旧的
+- 输出一句话（最长 60 字），不要列点，不要加日期/平台等元数据
+- **不要带主语**（不要"用户/他/dxj"等开头），直接陈述事实
+- 不要写"用户XX说"、"该信息于..."、"反映了..."等套话
+
+只输出融合后的那句话，不要其他文字。"""
+
+# 相似度阈值（mem0 的 search 分数 0-1）
+SIM_SKIP = 0.82    # ≥此：跳过（默认 0.92 太松，导致措辞稍变就放过）
+SIM_UPDATE = 0.62  # ≥此：合并到已有记忆
+
+
+_SUBJECT_PREFIX_RE = re.compile(
+    r"^(用户(?:[\u4e00-\u9fa5A-Za-z0-9]{1,12})?(?:的)?|"
+    r"[\u4e00-\u9fa5A-Za-z0-9]{1,12}的|"
+    r"他|她|我|本人|该用户|这位用户)"
+)
+
+
+def _strip_subject_prefix(text: str) -> str:
+    """剥掉记忆开头的主语前缀，使记忆更简洁。
+    "用户dxj定居北京" → "定居北京"
+    "dxj的妻子全职在家" → "妻子全职在家"
+    """
+    s = (text or "").strip()
+    # 只剥一次，避免误伤
+    m = _SUBJECT_PREFIX_RE.match(s)
+    if not m:
+        return s
+    rest = s[m.end():].lstrip(" ,，。：:")
+    # 如果剥完只剩半句话（太短），还是保留原文
+    if len(rest) < 4:
+        return s
+    return rest
 
 
 def _extract_candidates(messages: list) -> list[str]:
@@ -66,7 +123,7 @@ def _extract_candidates(messages: list) -> list[str]:
     )
     try:
         resp = client.chat.completions.create(
-            model=os.getenv("EXTRACT_MODEL", "qwen-turbo"),
+            model=os.getenv("EXTRACT_MODEL", "qwen-plus"),
             messages=[
                 {"role": "system", "content": CANDIDATE_EXTRACT_PROMPT},
                 {"role": "user", "content": text},
@@ -85,10 +142,36 @@ def _extract_candidates(messages: list) -> list[str]:
         return []
 
 
+def _llm_merge(old_text: str, new_text: str) -> str:
+    """用 LLM 把旧记忆 + 新增信息融合成一句简洁的话"""
+    try:
+        client = openai.OpenAI(
+            api_key=os.getenv("OPENAI_API_KEY"),
+            base_url=os.getenv("OPENAI_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+        )
+        resp = client.chat.completions.create(
+            model=os.getenv("EXTRACT_MODEL", "qwen-plus"),
+            messages=[
+                {"role": "system", "content": MERGE_MEMORY_PROMPT},
+                {"role": "user", "content": f"旧记忆：{old_text}\n新增信息：{new_text}"},
+            ],
+            temperature=0,
+        )
+        merged = (resp.choices[0].message.content or "").strip()
+        merged = merged.strip("`\"' ")
+        if not merged or len(merged) > 120:
+            # 兜底：取更长更具体的那条，新优先
+            return new_text if len(new_text) >= len(old_text) else old_text
+        return merged
+    except Exception as e:
+        logger.warning("_llm_merge failed: %s", e)
+        return new_text
+
+
 def _check_and_store(engine: Mem0Engine, user_id: str, text: str):
     """
-    对单条候选事实做相似度检查后决定：跳过 / 更新已有记忆 / 新建。
-    返回操作类型字符串，方便日志追踪。
+    对单条候选事实做相似度检查后决定：跳过 / 合并已有 / 新建。
+    所有写入都用 infer=False，避免 Mem0 自身再次抽取/改写产生噪音。
     """
     try:
         results = engine.search(text, user_id=user_id, limit=3)
@@ -103,15 +186,15 @@ def _check_and_store(engine: Mem0Engine, user_id: str, text: str):
                 return "skip"
 
             if score >= SIM_UPDATE:
-                # 合并：在旧记忆末尾追加新信息，避免信息丢失
                 old_text = top.get("memory", "")
-                merged = f"{old_text}；{text}" if old_text and old_text != text else text
+                merged = _llm_merge(old_text, text) if old_text and old_text != text else text
                 engine.update(top["id"], merged)
-                logger.info("[mem] update (score=%.3f): %s", score, text[:60])
+                logger.info("[mem] merge (score=%.3f): %s -> %s",
+                            score, text[:40], merged[:40])
                 return "update"
 
-        engine.add([{"role": "user", "content": text}], user_id=user_id)
-        logger.info("[mem] add new: %s", text[:60])
+        engine.add(text, user_id=user_id, infer=False)
+        logger.info("[mem] add: %s", text[:60])
         return "add"
 
     except Exception as e:
@@ -127,13 +210,15 @@ def extract_and_store_memory(user_id: str, messages: list):
     candidates = _extract_candidates(messages)
 
     if not candidates:
-        # 提炼失败时 fallback：直接交给 Mem0 处理
-        logger.info("[mem] fallback to direct add (no candidates extracted)")
-        engine.add(messages, user_id=user_id)
+        # 提炼失败时不写入，避免 Mem0 自身抽取出冗余/带元数据的噪音
+        logger.info("[mem] no candidates extracted, skip writing")
         return
 
     stats = {"skip": 0, "update": 0, "add": 0, "error": 0}
-    for text in candidates:
+    for raw in candidates:
+        text = _strip_subject_prefix(str(raw or ""))
+        if not text:
+            continue
         action = _check_and_store(engine, user_id, text)
         stats[action] = stats.get(action, 0) + 1
 
