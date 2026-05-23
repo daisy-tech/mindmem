@@ -42,10 +42,23 @@ export const useMemoryStore = defineStore('memory', () => {
     memories.value = memories.value.filter((m) => m.id !== memoryId)
   }
 
+  async function importMemories(texts: string[]): Promise<number> {
+    const auth = useAuthStore()
+    const res = await fetch(`${API_BASE}/api/memory/import`, {
+      method: 'POST',
+      headers: { ...auth.authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ memories: texts }),
+    })
+    const data = await res.json()
+    await fetchMemories()
+    return data.imported ?? 0
+  }
+
   return {
     memories,
     loading,
     fetchMemories,
     deleteMemory,
+    importMemories,
   }
 })

@@ -1,8 +1,12 @@
 <template>
   <div class="chat-view">
     <div class="chat-header">
-      <h3>新对话</h3>
-      <el-button size="small" @click="chatStore.clearChat()">清空</el-button>
+      <h3>{{ currentTitle }}</h3>
+      <div class="header-actions">
+        <el-button size="small" @click="chatStore.newConversation()">新对话</el-button>
+        <el-button size="small" @click="historyVisible = true">历史记录</el-button>
+        <el-button size="small" @click="chatStore.newConversation()">清空</el-button>
+      </div>
     </div>
     <div class="messages" ref="msgRef">
       <div v-if="chatStore.messages.length === 0" class="empty">
@@ -14,6 +18,7 @@
         v-for="(msg, i) in chatStore.messages"
         :key="i"
         :message="msg"
+        @inspect="openPromptDrawer"
       />
     </div>
     <div class="input-area">
@@ -36,19 +41,42 @@
         </template>
       </el-input>
     </div>
+
+    <PromptDrawer
+      :visible="promptVisible"
+      :prompt-data="activePromptData"
+      @close="promptVisible = false"
+    />
+
+    <ConversationDrawer
+      :visible="historyVisible"
+      @close="historyVisible = false"
+      @loaded="focusInput"
+    />
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, watch, nextTick } from 'vue'
+import { ref, computed, watch, nextTick, onMounted } from 'vue'
 import type { ElInput } from 'element-plus'
 import { useChatStore } from '../stores/chat'
+import type { PromptData } from '../stores/chat'
 import ChatMessage from '../components/ChatMessage.vue'
+import PromptDrawer from '../components/PromptDrawer.vue'
+import ConversationDrawer from '../components/ConversationDrawer.vue'
 
 const chatStore = useChatStore()
 const input = ref('')
 const msgRef = ref<HTMLDivElement>()
 const inputRef = ref<InstanceType<typeof ElInput>>()
+const promptVisible = ref(false)
+const historyVisible = ref(false)
+const activePromptData = ref<PromptData | undefined>()
+
+const currentTitle = computed(() => {
+  const conv = chatStore.conversations.find(c => c.id === chatStore.conversationId)
+  return conv?.title ?? '新对话'
+})
 
 function focusInput() {
   nextTick(() => inputRef.value?.focus())
@@ -61,6 +89,11 @@ function send() {
   focusInput()
 }
 
+function openPromptDrawer(data: PromptData) {
+  activePromptData.value = data
+  promptVisible.value = true
+}
+
 watch(
   () => [
     chatStore.messages.length,
@@ -68,9 +101,7 @@ watch(
   ],
   () => {
     nextTick(() => {
-      if (msgRef.value) {
-        msgRef.value.scrollTop = msgRef.value.scrollHeight
-      }
+      if (msgRef.value) msgRef.value.scrollTop = msgRef.value.scrollHeight
     })
   },
 )
@@ -81,6 +112,10 @@ watch(
     if (wasStreaming && !streaming) focusInput()
   },
 )
+
+onMounted(() => {
+  chatStore.fetchConversations()
+})
 </script>
 
 <style scoped>
@@ -96,6 +131,10 @@ watch(
   padding: 12px 24px;
   background: #fff;
   border-bottom: 1px solid #e4e7ed;
+}
+.header-actions {
+  display: flex;
+  gap: 6px;
 }
 .messages {
   flex: 1;

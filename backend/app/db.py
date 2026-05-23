@@ -23,6 +23,13 @@ async def get_db():
 
 async def init_db():
     # Import models so metadata is populated before create_all
-    from app.models import user  # noqa: F401
+    from app.models import user, profile, conversation, event  # noqa: F401
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # 迁移：为旧数据库添加 action 列（列已存在时忽略错误）
+        try:
+            await conn.exec_driver_sql(
+                "ALTER TABLE memory_audit_log ADD COLUMN action VARCHAR(32) DEFAULT ''"
+            )
+        except Exception:
+            pass  # 列已存在，忽略

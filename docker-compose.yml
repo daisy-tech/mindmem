@@ -12,6 +12,7 @@ services:
       - https_proxy=
       - all_proxy=
       - OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+      - CHAT_MODEL=qwen-max
       - QDRANT_HOST=qdrant
       - REDIS_URL=redis://redis:6379/0
       - USER_DB_PATH=/app/data/memobot.db
@@ -37,10 +38,14 @@ services:
       - https_proxy=
       - all_proxy=
       - OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+      - CHAT_MODEL=qwen-max
+      - EXTRACT_MODEL=qwen-turbo
       - QDRANT_HOST=qdrant
       - REDIS_URL=redis://redis:6379/0
+      - USER_DB_PATH=/app/data/memobot.db
     volumes:
       - ./backend:/app
+      - memobot_data:/app/data
     command: >
       sh -c "unset NO_PROXY no_proxy ALL_PROXY all_proxy HTTP_PROXY http_proxy HTTPS_PROXY https_proxy && watchmedo auto-restart --directory=/app --pattern=*.py --recursive -- celery -A celery_worker worker --loglevel=info"
     depends_on:
@@ -60,6 +65,30 @@ services:
       - redis_data:/data
     ports:
       - "6379:6379"
+
+  celery-beat:
+    build: ./backend
+    env_file: .env
+    environment:
+      - HTTP_PROXY=
+      - HTTPS_PROXY=
+      - ALL_PROXY=
+      - http_proxy=
+      - https_proxy=
+      - all_proxy=
+      - OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+      - CHAT_MODEL=qwen-max
+      - EXTRACT_MODEL=qwen-turbo
+      - QDRANT_HOST=qdrant
+      - REDIS_URL=redis://redis:6379/0
+      - USER_DB_PATH=/app/data/memobot.db
+    volumes:
+      - ./backend:/app
+      - memobot_data:/app/data
+    command: >
+      sh -c "unset NO_PROXY no_proxy ALL_PROXY all_proxy HTTP_PROXY http_proxy HTTPS_PROXY https_proxy && celery -A celery_worker beat --loglevel=info"
+    depends_on:
+      - redis
 
   frontend:
     build:

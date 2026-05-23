@@ -40,8 +40,11 @@ class Mem0Engine:
     def search(self, query: str, user_id: str, limit: int = 5):
         return self.client.search(query, top_k=limit, filters={"user_id": user_id})
 
+    def update(self, memory_id: str, new_text: str):
+        return self.client.update(memory_id, data=new_text)
+
     def get_all(self, user_id: str):
-        return self.client.get_all(filters={"user_id": user_id})
+        return self.client.get_all(filters={"user_id": user_id}, top_k=500)
 
     def delete(self, memory_id: str, user_id: str):
         return self.client.delete(memory_id)

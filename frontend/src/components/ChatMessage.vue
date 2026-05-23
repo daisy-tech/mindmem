@@ -12,19 +12,30 @@
         src="/memobot-avatar.png"
       />
     </div>
-    <div class="bubble">
+    <div
+      class="bubble"
+      :class="{ 'has-prompt': message.role === 'assistant' && message.promptData }"
+      @click="message.role === 'assistant' && message.promptData && $emit('inspect', message.promptData)"
+    >
       <div class="content">{{ message.content }}</div>
+      <div
+        v-if="message.role === 'assistant' && message.promptData"
+        class="inspect-hint"
+      >
+        <el-icon><Search /></el-icon> 查看 Prompt
+      </div>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { User } from '@element-plus/icons-vue'
-import type { Message } from '../stores/chat'
+import { User, Search } from '@element-plus/icons-vue'
+import type { Message, PromptData } from '../stores/chat'
 
 defineProps<{
   message: Message
 }>()
+defineEmits<{ inspect: [data: PromptData] }>()
 </script>
 
 <style scoped>
@@ -51,8 +62,29 @@ defineProps<{
   background: #a78bfa;
   color: #fff;
 }
+.bubble.has-prompt {
+  cursor: pointer;
+  transition: box-shadow 0.15s;
+}
+.bubble.has-prompt:hover {
+  box-shadow: 0 2px 10px rgba(64, 158, 255, 0.25);
+}
 .content {
   white-space: pre-wrap;
   line-height: 1.6;
+}
+.inspect-hint {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 8px;
+  font-size: 11px;
+  color: #c0c4cc;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.bubble.has-prompt:hover .inspect-hint {
+  opacity: 1;
+  color: #409eff;
 }
 </style>

@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.db import init_db
-from app.routers import auth, chat, memory
+from app.routers import auth, chat, memory, profile, conversations, events
 
 app = FastAPI(title="MemoBot API", version="0.2.0")
 
@@ -23,6 +23,9 @@ async def _startup():
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
 app.include_router(chat.router, prefix="/api/chat", tags=["chat"])
 app.include_router(memory.router, prefix="/api/memory", tags=["memory"])
+app.include_router(profile.router, prefix="/api/profile", tags=["profile"])
+app.include_router(conversations.router, prefix="/api/conversations", tags=["conversations"])
+app.include_router(events.router, prefix="/api/events", tags=["events"])
 
 
 @app.get("/health")
