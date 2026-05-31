@@ -37,3 +37,4 @@ Thumbs.db
 ._*
 # Celery Beat 运行时文件
 backend/celerybeat-schedule
+*_full_report.json

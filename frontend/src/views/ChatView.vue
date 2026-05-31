@@ -3,6 +3,9 @@
     <div class="chat-header">
       <h3>{{ currentTitle }}</h3>
       <div class="header-actions">
+        <el-button size="small" @click="personalityVisible = true">
+          性格：{{ personalityLabel }}
+        </el-button>
         <el-button size="small" @click="chatStore.newConversation()">新对话</el-button>
         <el-button size="small" @click="historyVisible = true">历史记录</el-button>
         <el-button size="small" @click="chatStore.newConversation()">清空</el-button>
@@ -53,6 +56,12 @@
       @close="historyVisible = false"
       @loaded="focusInput"
     />
+
+    <PersonalityPicker
+      :visible="personalityVisible"
+      @close="closePersonality"
+      @saved="onPersonalitySaved"
+    />
   </div>
 </template>
 
@@ -61,21 +70,32 @@ import { ref, computed, watch, nextTick, onMounted } from 'vue'
 import type { ElInput } from 'element-plus'
 import { useChatStore } from '../stores/chat'
 import type { PromptData } from '../stores/chat'
+import { usePersonalityStore } from '../stores/personality'
 import ChatMessage from '../components/ChatMessage.vue'
 import PromptDrawer from '../components/PromptDrawer.vue'
 import ConversationDrawer from '../components/ConversationDrawer.vue'
+import PersonalityPicker from '../components/PersonalityPicker.vue'
 
 const chatStore = useChatStore()
+const personalityStore = usePersonalityStore()
 const input = ref('')
 const msgRef = ref<HTMLDivElement>()
 const inputRef = ref<InstanceType<typeof ElInput>>()
 const promptVisible = ref(false)
 const historyVisible = ref(false)
+const personalityVisible = ref(false)
 const activePromptData = ref<PromptData | undefined>()
+
+const PERSONALITY_PICKED_KEY = 'memobot_personality_picked'
 
 const currentTitle = computed(() => {
   const conv = chatStore.conversations.find(c => c.id === chatStore.conversationId)
   return conv?.title ?? '新对话'
+})
+
+const personalityLabel = computed(() => {
+  const opt = personalityStore.options.find(o => o.value === personalityStore.personality)
+  return opt?.label ?? '中性型'
 })
 
 function focusInput() {
@@ -113,9 +133,23 @@ watch(
   },
 )
 
-onMounted(() => {
+onMounted(async () => {
   chatStore.fetchConversations()
+  await personalityStore.fetchPersonality()
+  if (!localStorage.getItem(PERSONALITY_PICKED_KEY)) {
+    personalityVisible.value = true
+  }
 })
+
+function onPersonalitySaved() {
+  localStorage.setItem(PERSONALITY_PICKED_KEY, '1')
+}
+
+function closePersonality() {
+  personalityVisible.value = false
+  // 即使用户没保存，也标记已询问过，避免每次进来都弹
+  localStorage.setItem(PERSONALITY_PICKED_KEY, '1')
+}
 </script>
 
 <style scoped>

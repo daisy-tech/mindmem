@@ -1,7 +1,7 @@
 import json
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import select, desc
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -10,6 +10,14 @@ from app.auth import get_current_user
 from app.db import get_db
 from app.models.profile import UserProfile, MemoryAuditLog
 from app.models.user import User
+from app.services.personality import (
+    DEFAULT_PERSONALITY,
+    MemoryPersonality,
+    PERSONALITY_CONFIG,
+    get_personality,
+    list_personalities,
+    set_personality,
+)
 from app.services.profile_engine import _set_nested, _del_nested, _now_iso, _label
 
 router = APIRouter()
@@ -140,3 +148,51 @@ def _safe_json(s: str):
         return json.loads(s)
     except Exception:
         return s
+
+
+# ---------- 记忆人格 ----------
+
+
+class PersonalityRequest(BaseModel):
+    personality: str
+
+
+@router.get("/personality")
+async def get_personality_api(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    row = await _get_or_create_profile(user.id, db)
+    profile = json.loads(row.profile_json or "{}")
+    current = get_personality(profile).value
+    return {
+        "personality": current,
+        "default": DEFAULT_PERSONALITY.value,
+        "options": list_personalities(),
+        "config": PERSONALITY_CONFIG.get(current, {}),
+    }
+
+
+@router.post("/personality")
+async def set_personality_api(
+    body: PersonalityRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        personality = MemoryPersonality(body.personality)
+    except ValueError:
+        valid = ", ".join(p.value for p in MemoryPersonality)
+        raise HTTPException(400, f"无效的人格类型，仅支持：{valid}")
+
+    row = await _get_or_create_profile(user.id, db)
+    profile = json.loads(row.profile_json or "{}")
+    set_personality(profile, personality)
+    row.profile_json = json.dumps(profile, ensure_ascii=False)
+    row.last_updated = datetime.now(timezone.utc)
+    await db.commit()
+    return {
+        "ok": True,
+        "personality": personality.value,
+        "config": PERSONALITY_CONFIG.get(personality.value, {}),
+    }

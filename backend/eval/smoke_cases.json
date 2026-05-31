@@ -1,0 +1,231 @@
+{
+  "version": "1.0",
+  "persona_ref": "persona_a_zhang",
+  "cases": [
+    {
+      "id": "A-c01",
+      "bucket": "casual",
+      "personality": "balanced",
+      "history": [],
+      "message": "在吗",
+      "expect": {
+        "intent": "casual",
+        "must_activate": [],
+        "forbidden_activate": ["M01", "M03", "M05"]
+      }
+    },
+    {
+      "id": "A-c03",
+      "bucket": "casual",
+      "personality": "balanced",
+      "history": [],
+      "message": "周末了",
+      "expect": {
+        "intent": "casual",
+        "must_activate": [],
+        "forbidden_phrases_in_system": ["面试", "裁员"]
+      }
+    },
+    {
+      "id": "A-s01",
+      "bucket": "self_summary",
+      "personality": "balanced",
+      "history": [],
+      "message": "你了解我吗，说说看",
+      "expect": {
+        "intent": "self_summary",
+        "must_activate_keywords": ["工作", "家", "面试"]
+      }
+    },
+    {
+      "id": "A-s03",
+      "bucket": "self_summary",
+      "personality": "balanced",
+      "history": [],
+      "message": "最近我有什么事你在意的？",
+      "expect": {
+        "intent": "self_summary",
+        "must_activate_keywords": ["面试", "安置", "裁员"]
+      }
+    },
+    {
+      "id": "A-r01",
+      "bucket": "relationship_topic",
+      "personality": "balanced",
+      "history": [
+        {"role": "user", "content": "老婆在家带小宇，我基本帮不上忙。"},
+        {"role": "assistant", "content": "你这段时间确实很难两边都顾到。"}
+      ],
+      "message": "她最近还是很累",
+      "expect": {
+        "intent": "relationship_topic",
+        "must_activate_keywords": ["妻子", "小雅", "带娃", "累"]
+      }
+    },
+    {
+      "id": "A-r04",
+      "bucket": "relationship_topic",
+      "personality": "balanced",
+      "history": [
+        {"role": "user", "content": "最近和小雅有点僵。"},
+        {"role": "assistant", "content": "你们之间发生什么了？"}
+      ],
+      "message": "她有点怨我",
+      "expect": {
+        "intent": "relationship_topic",
+        "must_activate_keywords": ["妻子", "小雅", "分担"]
+      }
+    },
+    {
+      "id": "A-e01",
+      "bucket": "emotional_support",
+      "personality": "balanced",
+      "history": [],
+      "message": "最近压力好大",
+      "expect": {
+        "intent": "emotional_support",
+        "forbidden_phrases_in_reply": ["听起来你", "你一定"]
+      }
+    },
+    {
+      "id": "A-e04",
+      "bucket": "emotional_support",
+      "personality": "balanced",
+      "history": [],
+      "message": "烦死了",
+      "expect": {
+        "intent": "emotional_support"
+      }
+    },
+    {
+      "id": "A-pf01",
+      "bucket": "plan_followup",
+      "personality": "balanced",
+      "history": [],
+      "message": "在吗",
+      "expect": {
+        "intent": "casual",
+        "optional_intents": ["plan_followup", "casual"]
+      }
+    },
+    {
+      "id": "A-pf02",
+      "bucket": "plan_followup",
+      "personality": "balanced",
+      "history": [
+        {"role": "user", "content": "下周一有个面试。"},
+        {"role": "assistant", "content": "是什么岗位？"}
+      ],
+      "message": "明天有点紧张",
+      "expect": {
+        "intent": "plan_followup",
+        "must_activate_keywords": ["面试", "星维"]
+      }
+    },
+    {
+      "id": "A-x01",
+      "bucket": "correction",
+      "personality": "balanced",
+      "history": [],
+      "message": "你记错了，不是产品总监，是技术总监",
+      "expect": {
+        "intent": "correction"
+      }
+    },
+    {
+      "id": "A-x03",
+      "bucket": "correction",
+      "personality": "balanced",
+      "history": [],
+      "message": "别再提面试的事了",
+      "expect": {
+        "intent": "correction"
+      }
+    },
+    {
+      "id": "A-k01",
+      "bucket": "knowledge_task",
+      "personality": "balanced",
+      "history": [],
+      "message": "帮我写一段 SQL，统计每月订单数",
+      "expect": {
+        "intent": "knowledge_task"
+      }
+    },
+    {
+      "id": "A-k03",
+      "bucket": "knowledge_task",
+      "personality": "balanced",
+      "history": [],
+      "message": "Python 怎么读 CSV",
+      "expect": {
+        "intent": "knowledge_task"
+      }
+    },
+    {
+      "id": "A-pr01",
+      "bucket": "proactive",
+      "personality": "extrovert",
+      "history": [],
+      "message": "早",
+      "expect": {
+        "optional_intents": ["casual", "plan_followup"]
+      }
+    },
+    {
+      "id": "A-pr03",
+      "bucket": "proactive",
+      "personality": "balanced",
+      "history": [],
+      "message": "下周一那场你记得吧",
+      "expect": {
+        "intent": "plan_followup",
+        "must_activate_keywords": ["面试", "6", "星维"]
+      }
+    },
+    {
+      "id": "A-pr04",
+      "bucket": "proactive",
+      "personality": "balanced",
+      "history": [
+        {"role": "user", "content": "老婆在家带小宇，我基本帮不上忙。"},
+        {"role": "assistant", "content": "你这段时间确实很难两边都顾到。"}
+      ],
+      "message": "她最近还是很累",
+      "expect": {
+        "intent": "relationship_topic"
+      }
+    },
+    {
+      "id": "A-pr06",
+      "bucket": "proactive",
+      "personality": "balanced",
+      "history": [],
+      "message": "有点难",
+      "expect": {
+        "forbidden_phrases_in_reply": ["加油"]
+      }
+    },
+    {
+      "id": "A-pr07",
+      "bucket": "proactive",
+      "personality": "balanced",
+      "history": [],
+      "message": "在吗",
+      "expect": {
+        "note": "人格三连对比请在明细页手动切换人格后复测"
+      }
+    },
+    {
+      "id": "A-pr10",
+      "bucket": "proactive",
+      "personality": "balanced",
+      "history": [],
+      "message": "我最近咋样，你有在跟吗？",
+      "expect": {
+        "intent": "self_summary",
+        "must_activate_keywords": ["面试", "工作", "家"]
+      }
+    }
+  ]
+}

@@ -1,0 +1,109 @@
+{
+  "persona_ref": "persona_a_zhang",
+  "display_name": "合成用户A · 张明远（老张）",
+  "eval_as_of": "2026-05-31",
+  "phone": "13800000001",
+  "nickname": "老张",
+  "profile": {
+    "profile": {
+      "basic": {
+        "name": { "value": "张明远", "confidence": 0.95, "updated_at": "2026-05-31T00:00:00Z" },
+        "nickname": { "value": "老张", "confidence": 0.9, "updated_at": "2026-05-31T00:00:00Z" },
+        "gender": { "value": "男", "confidence": 0.9, "updated_at": "2026-05-31T00:00:00Z" },
+        "birthday": { "value": "1986", "confidence": 0.9, "updated_at": "2026-05-31T00:00:00Z" },
+        "location": { "value": "上海浦东新区张江镇", "confidence": 0.9, "updated_at": "2026-05-31T00:00:00Z" }
+      },
+      "career": {
+        "job_title": { "value": "研发总监", "confidence": 0.9, "updated_at": "2026-05-31T00:00:00Z" },
+        "industry": { "value": "云迹科技，企业协同 SaaS", "confidence": 0.85, "updated_at": "2026-05-31T00:00:00Z" },
+        "work_pain_points": {
+          "value": "公司组织调整、裁员风险、安置方案待定",
+          "confidence": 0.85,
+          "updated_at": "2026-05-31T00:00:00Z"
+        }
+      },
+      "social": {
+        "relationships": {
+          "value": {
+            "小雅": "妻子，全职在家带儿子小宇，近期常抱怨累、失眠、睡眠差，希望老张多分担家务",
+            "小宇": "儿子，7岁，刚上小学，数学成绩一般",
+            "阿明": "前同事，被裁后去了星维 SaaS，偶尔帮忙内推面试"
+          },
+          "confidence": 0.92,
+          "updated_at": "2026-05-31T00:00:00Z"
+        }
+      },
+      "goals_pains": {
+        "current_pains": {
+          "value": "工作压力大，可能被优化；妻子带娃很累；同时在看外部机会",
+          "confidence": 0.85,
+          "updated_at": "2026-05-31T00:00:00Z"
+        },
+        "short_term_goals": {
+          "value": "等云迹 HR 陈晓谈安置方案；准备星维二面",
+          "confidence": 0.8,
+          "updated_at": "2026-05-31T00:00:00Z"
+        }
+      },
+      "interests": {
+        "long_term": { "value": "跑步、历史播客", "confidence": 0.7, "updated_at": "2026-05-31T00:00:00Z" }
+      }
+    }
+  },
+  "events": [
+    {
+      "event_id": "E01",
+      "event_type": "plan",
+      "summary": "6月2日（周一）下午星维 SaaS 视频二面，产品总监岗位",
+      "occurred_at": "2026-06-02",
+      "importance": 0.9
+    },
+    {
+      "event_id": "E02",
+      "event_type": "plan",
+      "summary": "本周内等云迹科技 HR 陈晓谈裁员安置方案",
+      "occurred_at": "2026-05-27",
+      "importance": 0.85
+    },
+    {
+      "event_id": "E03",
+      "event_type": "pain_point",
+      "summary": "妻子小雅说一个人带娃太累了，老张当时只回了再忍忍",
+      "occurred_at": "2026-05-20",
+      "importance": 0.88
+    },
+    {
+      "event_id": "E04",
+      "event_type": "plan",
+      "summary": "上周墨云科技面试感觉一般，还在等回音",
+      "occurred_at": "2026-05-22",
+      "importance": 0.75
+    },
+    {
+      "event_id": "E05",
+      "event_type": "status_change",
+      "summary": "云迹科技启动组织调整，老张所在团队可能被优化",
+      "occurred_at": "2026-05-25",
+      "importance": 0.9
+    },
+    {
+      "event_id": "E06",
+      "event_type": "experience",
+      "summary": "阿明帮内推了星维的产品总监岗位，已收到二面通知",
+      "occurred_at": "2026-05-28",
+      "importance": 0.8
+    }
+  ],
+  "episodic": [
+    "[M01] 云迹科技 CloudTrail 约 180 人，做企业协同 SaaS，老张是研发总监，近期公司裁员风声很大。",
+    "[M02] 老张房贷约 1.8 万/月，2020 年在上海买了小三室，工作繁忙很少跑步。",
+    "[M03] 星维 SaaS 的产品总监岗位是阿明内推的，6/2 下午有一场视频二面，老张有点紧张。",
+    "[M04] 妻子小雅全职带 7 岁儿子小宇，最近常失眠，抱怨老张分担家务太少。",
+    "[M05] 小宇数学还是老样子，妻子希望老张周末多陪孩子。",
+    "[M06] HR 陈晓还没给安置方案的信儿，老张一边上班一边偷偷面试。",
+    "[M07] 上次墨云科技面试感觉一般，产品方向和老张经验不太匹配。",
+    "[M08] 老张和张明远都是本人，用户自称老张，不要主动叫全名。",
+    "[M09] 家里最近事多，带娃、面试、安置方案几件事叠在一起，老张压力挺大。",
+    "[M10] 阿明在星维那边帮忙盯着内推进度，问有没有回音。"
+  ]
+}

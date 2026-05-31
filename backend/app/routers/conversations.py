@@ -73,8 +73,19 @@ async def save_conversation(
     )
     conv = result.scalar_one_or_none()
 
-    # 过滤掉 system 消息，只存 user/assistant
-    storable = [m for m in body.messages if m.get("role") in ("user", "assistant")]
+    # 过滤掉 system 消息，只存 user/assistant；保留每轮扩展元数据
+    storable: list[dict] = []
+    for m in body.messages:
+        if m.get("role") not in ("user", "assistant"):
+            continue
+        item: dict = {
+            "role": m["role"],
+            "content": m.get("content", ""),
+        }
+        for key in ("ts", "turn_id", "prompt_meta", "error"):
+            if key in m and m[key] is not None:
+                item[key] = m[key]
+        storable.append(item)
 
     if conv is None:
         conv = Conversation(

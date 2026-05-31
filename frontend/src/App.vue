@@ -24,6 +24,10 @@
             <el-icon><Collection /></el-icon>
             <span>记忆画廊</span>
           </el-menu-item>
+          <el-menu-item index="/eval">
+            <el-icon><DataAnalysis /></el-icon>
+            <span>评测实验室</span>
+          </el-menu-item>
         </el-menu>
         <div class="user-panel" v-if="auth.user">
           <div class="user-info">
@@ -60,7 +64,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ChatDotRound, Collection, SwitchButton } from '@element-plus/icons-vue'
+import { ChatDotRound, Collection, SwitchButton, DataAnalysis } from '@element-plus/icons-vue'
 import { ElMessageBox } from 'element-plus'
 import { useAuthStore } from './stores/auth'
 import { useChatStore } from './stores/chat'

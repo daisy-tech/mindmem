@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 
-const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000'
+import { API_BASE } from '../config/api'
 const TOKEN_KEY = 'memobot_token'
 const USER_KEY = 'memobot_user'
 
@@ -34,6 +34,8 @@ export const useAuthStore = defineStore('auth', () => {
     user.value = null
     localStorage.removeItem(TOKEN_KEY)
     localStorage.removeItem(USER_KEY)
+    // 退出登录时清掉"人格已询问过"的标记，下次新用户进来重新弹
+    localStorage.removeItem('memobot_personality_picked')
   }
 
   async function sendCode(phone: string): Promise<{ dev_code?: string }> {

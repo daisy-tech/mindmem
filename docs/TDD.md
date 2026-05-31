@@ -316,11 +316,397 @@ StreamingResponse 完成
 
 ---
 
-## 6. LLM 使用策略
+## 6. Memory Use v1 设计
+
+### 6.1 MemoBot 记忆人格
+
+v1 引入三类记忆人格，用于控制记忆表达边界、事件主动跟进程度和追问强度。人格不改变事实正确性和敏感信息硬边界。
+
+```python
+class MemoryPersonality(str, Enum):
+    INTROVERT = "introvert"
+    BALANCED = "balanced"
+    EXTROVERT = "extrovert"
+```
+
+**配置草案**
+
+```python
+PERSONALITY_CONFIG = {
+    "introvert": {
+        "label": "内向型",
+        "max_explicit_memories": 1,
+        "allow_casual_memory": False,
+        "plan_followup": "asked_only",
+        "pain_point_policy": "background_only",
+        "question_style": "low",
+    },
+    "balanced": {
+        "label": "中性型",
+        "max_explicit_memories": 2,
+        "allow_casual_memory": False,
+        "plan_followup": "once",
+        "pain_point_policy": "triggered_only",
+        "question_style": "medium",
+    },
+    "extrovert": {
+        "label": "外向型",
+        "max_explicit_memories": 3,
+        "allow_casual_memory": True,
+        "plan_followup": "active_once",
+        "pain_point_policy": "soft_triggered",
+        "question_style": "high",
+    },
+}
+```
+
+**持久化方案**
+- v1 可先保存到用户画像：`interaction_history.memory_personality`
+- 后续若设置项增多，可迁移到独立 `user_settings` 表
+- 默认值：`balanced`
+- 切换人格只影响之后的对话，不修改历史记忆
+
+### 6.2 记忆路由器
+
+v1 采用规则优先的 Memory Router，不引入独立 LLM Router。它位于 `chat.py` 和各记忆服务之间，负责生成 `MemoryRoute` 和 `MemoryContext`。
+
+> **v1.5 计划**：见 [Memory-Router-v1.5.md](./Memory-Router-v1.5.md)。架构拆为三层：Layer 1 硬规则 → Layer 2 小模型 intent 分类 → Layer 3 策略查表（本节下表不变）。
+
+**输入**
+
+```python
+class MemoryRouteInput(BaseModel):
+    user_id: str
+    message: str
+    recent_history: list[ChatMessage]  # 最近 3-5 轮
+    personality: MemoryPersonality
+    profile_summary: str | None = None
+    relationship_keys: list[str] = []
+```
+
+**输出**
+
+```python
+class MemoryUsage(str, Enum):
+    EXPLICIT_OK = "explicit_ok"
+    BACKGROUND_ONLY = "background_only"
+    FOLLOW_UP_ONCE = "follow_up_once"
+    AVOID_UNLESS_ASKED = "avoid_unless_asked"
+
+
+class MemoryRoute(BaseModel):
+    intent: str
+    memory_depth: Literal["minimal", "focused", "broad", "safe_focused", "event_focused"]
+    load_layers: list[str]
+    query: str
+    sensitive_mode: bool = False
+    max_explicit_memories: int
+```
+
+**上下文结构**
+
+```python
+class RoutedMemory(BaseModel):
+    source: Literal["profile", "relationship", "event", "episodic"]
+    text: str
+    usage: MemoryUsage
+    reason: str
+    score: float = 0.0
+
+
+class MemoryContext(BaseModel):
+    route: MemoryRoute
+    stable_profile: list[RoutedMemory]
+    relevant_relationships: list[RoutedMemory]
+    relevant_events: list[RoutedMemory]
+    relevant_memories: list[RoutedMemory]
+    background_only: list[RoutedMemory]
+    do_not_mention: list[RoutedMemory]
+```
+
+**意图路由规则**
+
+| intent | 触发信号 | load_layers | memory_depth | 默认 usage |
+|--------|----------|-------------|--------------|-------------|
+| `casual` | 问候、闲聊开场 | profile_basic | minimal | background_only |
+| `self_summary` | "你了解我吗"、"你记得什么" | profile, relationships, events, episodic | broad | explicit_ok |
+| `relationship_topic` | 人名、亲属称谓、代词 | relationships, episodic, events | focused | explicit_ok / background_only |
+| `emotional_support` | 烦、累、压力、焦虑等 | profile_basic, episodic, events | safe_focused | background_only |
+| `plan_followup` | 明天、下周、准备、计划 | events, episodic | event_focused | follow_up_once |
+| `preference_request` | 推荐、适合、怎么学等 | profile, episodic | focused | explicit_ok |
+| `correction` | 不是、记错、忘掉 | profile, episodic | focused | avoid_unless_asked |
+| `knowledge_task` | 技术/工具/通用知识问题 | profile_basic | minimal | background_only |
+
+**检索 query 生成**
+- 不只使用当前消息
+- 组合：当前消息 + 最近 3-5 轮上下文 + 已识别人物/主题
+- 例：用户说"她最近还是很累"，最近上下文提到"老婆"，query 应扩展为"妻子、全职带孩子、工作忙、家庭分担、很累"
+
+**规则优先的 intent 打分**
+
+v1 不调用独立 LLM Router，而是使用规则打分 + 优先级覆盖。每个 intent 初始分数为 0，命中特征后加分，最终取最高优先级的高分 intent。
+
+```python
+INTENT_PRIORITIES = [
+    "correction",
+    "self_summary",
+    "knowledge_task",
+    "emotional_support",
+    "relationship_topic",
+    "plan_followup",
+    "preference_request",
+    "casual",
+]
+
+def score_intents(message: str, context_text: str, relationship_keys: list[str]) -> dict[str, int]:
+    scores = defaultdict(int)
+
+    if contains_any(message, ["你了解我", "你记得我", "我身边", "总结一下我"]):
+        scores["self_summary"] += 5
+
+    if contains_any(message, relationship_keys):
+        scores["relationship_topic"] += 4
+
+    if contains_any(message, ["她", "他", "孩子", "老婆", "妻子", "儿子", "邻居"]):
+        scores["relationship_topic"] += 3
+
+    if contains_any(message, ["烦", "累", "压力", "焦虑", "撑不住", "难受"]):
+        scores["emotional_support"] += 4
+
+    if contains_any(message, ["明天", "下周", "计划", "准备", "打算", "要去", "开始"]):
+        scores["plan_followup"] += 3
+
+    if contains_any(message, ["推荐", "适合", "怎么学", "怎么安排"]):
+        scores["preference_request"] += 3
+
+    if contains_any(message, ["你记错", "不是", "忘掉", "删除", "不对"]):
+        scores["correction"] += 10
+
+    # 上下文补偿：当前句子很短，但最近上下文能指向人物或主题
+    if contains_any(message, ["她", "他", "这事", "那个"]) and contains_any(context_text, ["老婆", "妻子", "儿子"]):
+        scores["relationship_topic"] += 5
+
+    return scores
+```
+
+**默认保守策略**
+- 若所有 intent 分数都低于阈值，落到 `casual`
+- 若命中多个 intent，按 `INTENT_PRIORITIES` 决定
+- `correction` 永远最高优先级，避免系统在用户纠错时继续使用错误记忆
+- `knowledge_task` 命中时默认不加载隐私记忆，只保留交互风格
+
+**记忆层加载映射**
+
+| layer | 说明 | 使用场景 |
+|-------|------|----------|
+| `profile_basic` | 姓名、城市、职业、称呼/交流偏好 | casual、knowledge_task |
+| `profile` | 完整结构化画像 | self_summary、preference_request |
+| `profile_style` | 只影响表达方式的偏好 | knowledge_task |
+| `relationships` | `social.relationships` | relationship_topic、self_summary |
+| `events` | 事件记忆候选池 | plan_followup、emotional_support、self_summary |
+| `episodic` | Mem0 情节记忆检索 | focused/broad 类场景 |
+
+### 6.3 MemoryContextBuilder
+
+`MemoryContextBuilder` 根据 `MemoryRoute` 拉取各层记忆，并为每条记忆计算分数和使用方式。Router 只做决策，不直接访问数据库和向量库。
+
+**处理流程**
+
+```text
+MemoryRoute
+  → load stable profile
+  → load relationships
+  → filter events by event_policy
+  → search episodic memories by route.query
+  → score and rank
+  → assign MemoryUsage
+  → truncate by personality limits
+  → return MemoryContext
+```
+
+**排序公式**
+
+```text
+final_score =
+  semantic_score * 0.45
++ recency_score * 0.20
++ importance_score * 0.20
++ intent_match_score * 0.15
+```
+
+字段来源：
+- `semantic_score`：Mem0/Qdrant search score；画像/关系可由规则赋值
+- `recency_score`：越近越高，超过 30 天显著降权
+- `importance_score`：事件 `importance`、画像置信度、关系字段置信度
+- `intent_match_score`：记忆类型与 route.intent 的匹配度
+
+**usage 标注规则**
+
+| 条件 | usage |
+|------|-------|
+| 用户明确问"你记得什么/你了解我吗" | `explicit_ok` |
+| 当前话题直接涉及某人/某事且非敏感 | `explicit_ok` |
+| `pain_point`、压力、家庭负担、负面情绪 | `background_only` |
+| `plan` 在跟进窗口内且未跟进 | `follow_up_once` |
+| archived / superseded / 低置信度 / 用户纠正为错误 | `avoid_unless_asked` 或不注入 |
+
+**截断规则**
+- `explicit_ok` 数量受人格 `max_explicit_memories` 限制
+- `background_only` 最多 3 条
+- `follow_up_once` 最多 1 条
+- `events` 每轮最多注入 3 条
+- `episodic` 每轮最多注入 5 条候选，最终可显性使用数量仍受人格限制
+
+### 6.4 Prompt 编排
+
+Memory Router 输出后，Prompt 不再简单拼接完整画像/事件/记忆，而是按使用策略分区。
+
+```text
+【稳定背景】
+- 只放低敏、长期稳定信息
+
+【当前相关记忆】
+- 最多 N 条，N 由人格决定
+- 可显性提及
+
+【背景信息（不要主动说出）】
+- 痛点、压力、敏感关系、反馈等
+
+【可轻跟进事件】
+- 仅放符合时间窗口且未跟进过的事件
+
+【本轮使用规则】
+- 哪些可以明说
+- 哪些只能影响语气和判断
+```
+
+SSE `type=prompt` 中除原始 system prompt 外，应逐步增加结构化字段，供 Prompt 透明面板展示：
+
+```json
+{
+  "type": "prompt",
+  "route": {"intent": "relationship_topic", "memory_depth": "focused"},
+  "activated": [
+    {"source": "relationship", "text": "妻子全职在家带孩子", "usage": "explicit_ok", "reason": "用户用代词'她'并延续妻子话题"}
+  ]
+}
+```
+
+### 6.5 事件记忆使用策略
+
+事件记忆按类型决定默认 usage、主动跟进窗口和注入优先级。
+
+| event_type | 默认 usage | 主动跟进 | 时间窗口 | 说明 |
+|------------|------------|----------|----------|------|
+| `plan` | follow_up_once | 是 | 明确日期：前 1 天到后 3 天；无日期：创建后 3-7 天 | 同一事件最多主动一次 |
+| `pain_point` | background_only | 否 | 仅相关话题触发 | 不主动戳痛点 |
+| `status_change` | explicit_ok/background_only | 可一次 | 创建后 7 天内 | 30 天后可转稳定背景候选 |
+| `achievement` | explicit_ok | 不反复 | 相关话题触发 | 可祝贺或延续 |
+| `experience` | background_only | 否 | 相关话题触发 | 普通经历过期快 |
+| `feedback` | background_only | 否 | 立即生效 | 主要影响回复风格 |
+
+**状态草案**
+
+| status | 含义 | 使用方式 |
+|--------|------|----------|
+| `active` | 仍可参与对话 | 正常参与路由 |
+| `followed_up` | 已主动跟进过 | 不再主动提，相关时可用 |
+| `resolved` | 用户明确完成/结束 | 作为历史，不主动跟进 |
+| `archived` | 用户/系统归档 | 不使用，除非用户主动问 |
+| `superseded` | 被新事件替代 | 不使用旧事件 |
+
+v1 可先通过 `status` 和 `details_json` 记录跟进状态，后续再做字段迁移。
+
+**事件筛选流程**
+
+```text
+route.intent
+  → 选择候选事件类型
+  → 过滤 archived/superseded
+  → 按时间窗口过滤
+  → 按相关性、importance、人格主动性排序
+  → 最多注入 3 条
+  → 为每条事件标注 usage
+```
+
+### 6.6 模块划分与接入点
+
+建议新增服务模块：
+
+```text
+backend/app/services/
+  memory_router.py      # intent 识别、人格配置、route 生成
+  memory_context.py     # 拉取/筛选/排序/usage 标注
+  prompt_composer.py    # 分区组装 system prompt + prompt_meta
+```
+
+`chat.py` 接入方式：
+
+```python
+# 当前
+profile_text = await _load_profile_text(user.id, db)
+events_text = await _load_events_text(user.id, db)
+memory_list = _search_memories_raw(user.id, message)
+system_prompt = _build_system_prompt(memory_text, profile_text, events_text)
+
+# v1
+route = memory_router.route(
+    user_id=user.id,
+    message=message,
+    recent_history=history[-10:],
+    personality=personality,
+)
+context = await memory_context_builder.build(route, db)
+system_prompt, prompt_meta = prompt_composer.compose(context)
+```
+
+**Prompt 透明面板**
+
+SSE `type=prompt` 除保留原始 system prompt 外，应增加结构化路由信息：
+
+```json
+{
+  "type": "prompt",
+  "route": {
+    "intent": "relationship_topic",
+    "memory_depth": "focused",
+    "personality": "balanced"
+  },
+  "activated": [
+    {
+      "source": "relationship",
+      "text": "妻子全职在家带孩子",
+      "usage": "explicit_ok",
+      "reason": "用户使用代词'她'，最近上下文是妻子话题"
+    },
+    {
+      "source": "event",
+      "text": "妻子在家带孩子很辛苦",
+      "usage": "background_only",
+      "reason": "该事件属于 pain_point，只作背景"
+    }
+  ]
+}
+```
+
+### 6.7 v1 非目标
+
+为控制复杂度，v1 暂不做：
+- 独立 LLM Router（**v1.5 见 [Memory-Router-v1.5.md](./Memory-Router-v1.5.md)**：仅 intent 分类，非完整 Route 生成）
+- 主动推送/定时提醒
+- 完整事件状态机迁移
+- 每条记忆的用户反馈按钮
+- 独立 `user_settings` 表（先复用画像 JSON）
+- 多人格独立长期 prompt 训练
+
+---
+
+## 7. LLM 使用策略
 
 | 场景 | 模型 | 原因 |
 |------|------|------|
 | 对话生成 | qwen-max | 语言质量要求高，需要自然表达 |
+| **记忆 intent 分类（v1.5）** | **qwen-plus / qwen-turbo** | **仅输出 intent JSON，temperature=0，与 Chat 隔离** |
 | 画像提取 | qwen-plus | 结构化 JSON 输出，质量优先（关系/事件抽取易出错） |
 | 事件提取 | qwen-plus | 结构化 JSON 输出，质量优先 |
 | 情节记忆候选提取 | qwen-plus | 高频任务，质量和成本平衡 |
@@ -331,9 +717,9 @@ StreamingResponse 完成
 
 ---
 
-## 7. 前端架构
+## 8. 前端架构
 
-### 7.1 技术栈
+### 8.1 技术栈
 
 - **框架**：Vue 3 (Composition API) + TypeScript
 - **状态管理**：Pinia（4 个 store：chat / memory / profile / events）
@@ -341,7 +727,7 @@ StreamingResponse 完成
 - **路由**：Vue Router 4
 - **构建**：Vite 5
 
-### 7.2 页面结构
+### 8.2 页面结构
 
 ```
 /login      -- 登录页
@@ -349,7 +735,7 @@ StreamingResponse 完成
 /memory     -- 记忆画廊（4 标签页：情节/画像/事件/关系图）
 ```
 
-### 7.3 Store 职责
+### 8.3 Store 职责
 
 | Store | 核心状态 | 核心方法 |
 |-------|---------|---------|
@@ -360,9 +746,9 @@ StreamingResponse 完成
 
 ---
 
-## 8. 部署架构
+## 9. 部署架构
 
-### 8.1 Docker Compose 服务依赖
+### 9.1 Docker Compose 服务依赖
 
 ```
 frontend ──→ backend ──→ qdrant
@@ -370,7 +756,7 @@ frontend ──→ backend ──→ qdrant
                               └──→ celery-beat
 ```
 
-### 8.2 数据持久化
+### 9.2 数据持久化
 
 | 卷名 | 挂载路径 | 内容 |
 |------|---------|------|
@@ -378,7 +764,7 @@ frontend ──→ backend ──→ qdrant
 | qdrant_data | /qdrant/storage | 向量数据 |
 | redis_data | /data | Redis AOF/RDB |
 
-### 8.3 环境变量
+### 9.3 环境变量
 
 | 变量名 | 默认值 | 说明 |
 |--------|-------|------|
@@ -394,21 +780,21 @@ frontend ──→ backend ──→ qdrant
 
 ---
 
-## 9. 关键设计决策
+## 10. 关键设计决策
 
-### 9.1 为什么用 SQLite 而非 PostgreSQL？
+### 10.1 为什么用 SQLite 而非 PostgreSQL？
 
 情节记忆已存 Qdrant，结构化数据量（用户、事件、会话）在百万行以内，SQLite 零运维成本且满足需求。
 
-### 9.2 为什么画像存 JSON 而非关系型字段？
+### 10.2 为什么画像存 JSON 而非关系型字段？
 
 画像结构动态扩展，不同用户字段覆盖率差异大，JSON blob + Python 解析成本最低，查询主要为全量读取。
 
-### 9.3 为什么事件去重用双层？
+### 10.3 为什么事件去重用双层？
 
 - SQLite 关键词过滤：O(1) 快速排除明显不相关记录，降低 Qdrant 查询量
 - Qdrant 向量相似度：捕获语义相似但表述不同的重复事件（0.75 阈值覆盖度量变体）
 
-### 9.4 为什么画像冲突不需要用户确认？
+### 10.4 为什么画像冲突不需要用户确认？
 
 AI 伴侣场景下用户不应被频繁打扰确认信息。三类字段策略（累加/覆盖/合并）覆盖 95% 以上更新场景，审计日志提供事后透明度。
