@@ -38,3 +38,7 @@ Thumbs.db
 # Celery Beat 运行时文件
 backend/celerybeat-schedule
 *_full_report.json
+# 评测/聊天本地导出（含真实对话内容，不入仓）
+*_smoke_report.json
+conv_*_chat_audit.json
+conv_*_eval_review.json

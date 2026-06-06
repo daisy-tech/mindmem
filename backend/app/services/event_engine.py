@@ -91,13 +91,14 @@ def extract_events_from_conversation(messages: list, current_date: str | None = 
     )
     try:
         resp = client.chat.completions.create(
-            model=os.getenv("EXTRACT_MODEL", os.getenv("CHAT_MODEL", "qwen-plus")),
+            model=os.getenv("EXTRACT_MODEL", os.getenv("CHAT_MODEL", "qwen3.7-plus")),
             messages=[
                 {"role": "system", "content": EXTRACT_PROMPT.format(
                     current_date=current_date, history=history_text
                 )},
             ],
             temperature=0,
+            extra_body={"enable_thinking": False},
         )
         raw = resp.choices[0].message.content.strip()
         if raw.startswith("```"):

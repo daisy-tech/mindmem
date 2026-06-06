@@ -15,6 +15,10 @@ export interface EvalRunSummary {
     pass_count?: number
     total?: number
     pass_rate?: number
+    threshold?: number
+    strict_pass_count?: number
+    strict_pass_rate?: number
+    intent_diverged_count?: number
   }
   suite?: { executed_cases?: number }
   error?: string
@@ -22,13 +26,21 @@ export interface EvalRunSummary {
 
 export interface EvalCaseL1 {
   intent_match?: boolean
+  intent_diverged?: boolean
   expected_intent?: string | string[]
   actual_intent?: string
+  intent_confidence?: number | null
+  intent_source?: string
+  router_version?: string
   keyword_hits?: number
   keyword_total?: number
-  boundary_violations?: string[]
-  reply_violations?: string[]
+  boundary_violations?: string[] | null
+  reply_violations?: string[] | null
+  reply_check_skipped?: boolean
   pass?: boolean
+  pass_strict?: boolean
+  pass_lenient?: boolean
+  saved_by_recall?: boolean
 }
 
 export interface EvalCaseResult {

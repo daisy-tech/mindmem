@@ -1,8 +1,8 @@
 # Memory Router v1.5 技术方案
 
 > 方案代号：**Hybrid Router A**（规则 + 小模型意图分类）  
-> 版本：1.0 | 日期：2026-05-31 | 状态：Draft  
-> 关联文档：[PRD.md §2.7](./PRD.md) · [TDD.md §6.2](./TDD.md)
+> 版本：1.2 | 日期：2026-06-06 | 状态：Released  
+> 关联文档：[PRD.md §2.7](./PRD.md) · [TDD.md §6.2](./TDD.md) · [Correction-Pipeline.md](./Correction-Pipeline.md) · [Real-Chat-Eval.md](./Real-Chat-Eval.md)
 
 ---
 
@@ -494,3 +494,6 @@ INTENT_CLASSIFIER_ENABLED=false
 | 日期 | 版本 | 说明 |
 |------|------|------|
 | 2026-05-31 | 1.0 | 初稿：Hybrid Router A（规则 + 小模型分类） |
+| 2026-06-06 | 1.1 | 配合记忆纠错管线与评估系统的小幅修订：① Layer 2 失败降级阈值上调至 conf<0.5；② query 构建只取最近 1 句 user 消息，避免历史稀释；③ `MemoryRoute` 增加 `router_version` 字段（写入 prompt_meta）便于评测分桶；④ `correction` 触发后 chat.py 跳过 extract_*（见 Correction-Pipeline §2.2）|
+| 2026-06-06 | 1.2 | LLM 全链路升级到 Qwen3.7：`INTENT_MODEL=qwen3.7-plus`，并显式 `extra_body={"enable_thinking": False}`；与 Chat `qwen3.7-max` 隔离；分类器延迟保持 P95 < 500ms |
+| 2026-06-06 | 1.2 | Prompt Composer 瘦身：去掉 `BACKGROUND_USAGE_RULES`；空块不渲染；本轮规则去掉调试元信息；intent guide 平均压缩 50% → 平均 prompt 节省 ~45% tokens（详见 TDD §6.4） |

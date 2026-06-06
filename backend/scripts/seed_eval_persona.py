@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sys
@@ -21,12 +22,12 @@ _APP_ROOT = os.path.abspath(os.path.join(_HERE, ".."))
 if _APP_ROOT not in sys.path:
     sys.path.insert(0, _APP_ROOT)
 
-from app.services.eval_persona import seed_persona_sync  # noqa: E402
+from app.services.eval_persona import seed_persona  # noqa: E402
 
 
 def main() -> None:
     persona_ref = sys.argv[1] if len(sys.argv) > 1 else "persona_a_zhang"
-    result = seed_persona_sync(persona_ref)
+    result = asyncio.run(seed_persona(persona_ref))
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

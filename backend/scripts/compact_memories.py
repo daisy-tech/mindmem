@@ -72,6 +72,7 @@ def llm_compact(texts: list[str], model: str) -> list[str]:
             {"role": "user", "content": f"原始记忆条目：\n{numbered}\n\n请输出精简后的 JSON 字符串数组："},
         ],
         temperature=0,
+        extra_body={"enable_thinking": False},
     )
     raw = (resp.choices[0].message.content or "").strip()
     if raw.startswith("```"):

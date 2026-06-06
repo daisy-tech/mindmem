@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 
 from typing import Literal
 
@@ -27,13 +28,25 @@ from app.services.eval_runner import (
     _load_suite,
 )
 from app.services.eval_persona import (
-    get_persona_data_sync,
+    get_persona_data,
     resolve_eval_user_id,
-    seed_persona_sync,
+    seed_persona,
 )
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+def _is_dev_mode() -> bool:
+    return os.getenv("DEV_MODE", "true").lower() == "true"
+
+
+def _require_dev_mode(action: str) -> None:
+    if not _is_dev_mode():
+        raise HTTPException(
+            403,
+            f"{action} 仅在 DEV_MODE=true 时可用，避免线上数据被任意账号重置",
+        )
 
 
 class StartEvalRequest(BaseModel):
@@ -173,25 +186,31 @@ async def eval_import_report(
 
 
 @router.get("/persona/data")
-async def eval_get_persona_data(user: User = Depends(get_current_user)):
+async def eval_get_persona_data(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     """查看 eval persona（老张）当前库内原始数据。"""
-    import asyncio
-
     try:
-        return await asyncio.to_thread(get_persona_data_sync, "persona_a_zhang")
+        return await get_persona_data("persona_a_zhang", db=db)
     except Exception as e:
         logger.exception("get persona data failed")
         raise HTTPException(500, f"读取失败: {e}")
 
 
 @router.post("/persona/seed")
-async def eval_seed_persona(user: User = Depends(get_current_user)):
-    """手动灌库：重置合成用户 A（persona_a_zhang）四层记忆。"""
-    import asyncio
+async def eval_seed_persona(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """手动灌库：重置合成用户 A（persona_a_zhang）四层记忆。
 
+    仅 DEV_MODE 下可用——任何登录账号都可触发会重置 eval 用户全部记忆，
+    线上必须明确开启才允许。
+    """
+    _require_dev_mode("灌库 eval persona")
     try:
-        result = await asyncio.to_thread(seed_persona_sync, "persona_a_zhang")
-        return result
+        return await seed_persona("persona_a_zhang", db=db)
     except FileNotFoundError as e:
         raise HTTPException(404, str(e))
     except Exception as e:
@@ -265,3 +284,39 @@ async def eval_delete_draft(
     if not delete_draft(user.id, draft_id):
         raise HTTPException(404, "草稿不存在")
     return {"ok": True}
+
+
+# ============ 线上聊天记录评估（P0+P1） ============
+# 用户点「开始评估」时调用；只读 SQLite（含 mem0 metadata），不调 LLM。
+# - 默认 include_legacy_snapshot=false：用当时 prompt_meta 自带的池子做对照
+# - 想看「评估时刻全库」做近似时再传 true
+@router.get("/chat-audit/{conversation_id}")
+async def eval_chat_audit(
+    conversation_id: str,
+    include_legacy_snapshot: bool = False,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    from sqlalchemy import select
+
+    from app.models.conversation import Conversation
+    from app.services.chat_audit import build_audit_pack
+    from app.services.eval_chat_review import review_audit_pack
+
+    result = await db.execute(
+        select(Conversation).where(
+            Conversation.id == conversation_id,
+            Conversation.user_id == user.id,
+        )
+    )
+    conv = result.scalar_one_or_none()
+    if conv is None:
+        raise HTTPException(404, "会话不存在或不属于当前用户")
+
+    pack = await build_audit_pack(
+        conv,
+        include_snapshot=include_legacy_snapshot,
+        db=db,
+    )
+    pack = review_audit_pack(pack)
+    return pack

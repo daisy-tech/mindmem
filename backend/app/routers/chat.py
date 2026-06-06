@@ -32,6 +32,7 @@ from celery_worker import (
     extract_and_store_events,
     extract_and_store_memory,
     extract_and_update_profile,
+    run_correction_cleanup_task,
 )
 
 logger = logging.getLogger(__name__)
@@ -41,17 +42,38 @@ router = APIRouter()
 DASHSCOPE_BASE_URL = os.getenv(
     "OPENAI_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"
 )
-CHAT_MODEL = os.getenv("CHAT_MODEL", "qwen-plus")
+CHAT_MODEL = os.getenv("CHAT_MODEL", "qwen3.7-max")
+# 百炼 Qwen3.5+ 是"混合思考模式"，Max 系列默认开启思考。
+# 流式 chat 等不起 think 阶段，统一关掉（设 ENABLE_THINKING=true 可开）。
+ENABLE_THINKING = os.getenv("ENABLE_THINKING", "false").lower() == "true"
 
 
 class ChatMessage(BaseModel):
     role: str
     content: str
+    # 前端可在 assistant 消息上携带上一轮的 prompt_meta（其中含 route.intent），
+    # 用于 Router v1.5 在低置信度时继承上一轮 intent。
+    prompt_meta: dict | None = None
 
 
 class ChatRequest(BaseModel):
     message: str
     history: list[ChatMessage] = []
+
+
+def _extract_previous_intent(history: list[ChatMessage]) -> str | None:
+    """从 history 末尾的 assistant 消息里反推上一轮 intent。"""
+    for msg in reversed(history or []):
+        if msg.role != "assistant":
+            continue
+        meta = msg.prompt_meta or {}
+        route = meta.get("route") if isinstance(meta, dict) else None
+        if isinstance(route, dict):
+            intent = route.get("intent")
+            if isinstance(intent, str) and intent:
+                return intent
+        return None
+    return None
 
 
 async def _load_profile_json(user_id: str, db: AsyncSession) -> dict:
@@ -81,7 +103,7 @@ async def _prepare_context(
     relationship_keys = collect_relationship_keys(profile_json)
 
     recent = [ChatTurn(role=m.role, content=m.content) for m in (history or [])[-10:]]
-    previous_intent = None
+    previous_intent = _extract_previous_intent(history or [])
     route = await route_async(
         MemoryRouteInput(
             user_id=user_id,
@@ -157,6 +179,7 @@ def _stream_response(
                 model=CHAT_MODEL,
                 messages=messages,
                 stream=True,
+                extra_body={"enable_thinking": ENABLE_THINKING},
             )
             async for chunk in stream:
                 if chunk.choices and chunk.choices[0].delta.content:
@@ -170,12 +193,36 @@ def _stream_response(
             return
 
         conversation = messages + [{"role": "assistant", "content": full_response}]
-        try:
-            extract_and_store_memory.delay(user_id, conversation)
-            extract_and_update_profile.delay(user_id, conversation)
-            extract_and_store_events.delay(user_id, conversation)
-        except Exception as e:
-            logger.warning("schedule celery tasks failed: %s", e)
+        route_info = prompt_meta.get("route") if isinstance(prompt_meta, dict) else None
+        intent = (route_info or {}).get("intent") if isinstance(route_info, dict) else None
+        is_correction = intent == "correction"
+
+        # 关键修复：correction 这一轮**绝不能**跑普通写入链路！
+        # 否则 AI 自己复述的错误事实（如"养两只小鹏"）会被 extract 抽出来
+        # 写回 episodic / profile，与 correction_cleanup_task 形成反向回路，越清越乱。
+        if not is_correction:
+            try:
+                extract_and_store_memory.delay(user_id, conversation)
+                extract_and_update_profile.delay(user_id, conversation)
+                extract_and_store_events.delay(user_id, conversation)
+            except Exception as e:
+                logger.warning("schedule celery tasks failed: %s", e)
+        else:
+            logger.info(
+                "[correction] skip extract tasks user=%s (avoid re-poisoning)",
+                user_id,
+            )
+            try:
+                run_correction_cleanup_task.delay(
+                    user_id,
+                    prompt_meta.get("conversation_id"),
+                    prompt_meta.get("turn_id"),
+                    [{"role": m["role"], "content": m["content"]}
+                     for m in conversation if m["role"] in ("user", "assistant")],
+                )
+                logger.info("[correction] scheduled cleanup user=%s", user_id)
+            except Exception as e:
+                logger.warning("schedule correction cleanup failed: %s", e)
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 

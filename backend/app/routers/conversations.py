@@ -1,7 +1,7 @@
 import json
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -10,6 +10,7 @@ from app.auth import get_current_user
 from app.db import get_db
 from app.models.conversation import Conversation
 from app.models.user import User
+from app.services.chat_audit import build_audit_pack
 
 router = APIRouter()
 
@@ -120,3 +121,26 @@ async def delete_conversation(
     )
     await db.commit()
     return {"ok": True}
+
+
+@router.get("/{conversation_id}/export")
+async def export_conversation_audit(
+    conversation_id: str,
+    include_snapshot: bool = Query(
+        False,
+        description="是否附带导出时刻的记忆库快照（profile/events/episodic）",
+    ),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """导出真实对话审计包（chat_audit_v1）：含每轮 prompt_meta、派生统计、一致性检查。"""
+    result = await db.execute(
+        select(Conversation).where(
+            Conversation.id == conversation_id,
+            Conversation.user_id == user.id,
+        )
+    )
+    conv = result.scalar_one_or_none()
+    if conv is None:
+        raise HTTPException(404, "会话不存在")
+    return await build_audit_pack(conv, include_snapshot=include_snapshot, db=db)

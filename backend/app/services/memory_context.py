@@ -119,6 +119,9 @@ class MemoryContext(BaseModel):
     relevant_events: list[RoutedMemory] = Field(default_factory=list)
     relevant_memories: list[RoutedMemory] = Field(default_factory=list)
     background_only: list[RoutedMemory] = Field(default_factory=list)
+    # 评估用：当时 pipeline 看到的池子统计（条数/检索 query/limit 等），
+    # 不再额外查 DB，写入 prompt_meta 后即可作为"时点快照"对照。
+    snapshot_stats: dict[str, Any] = Field(default_factory=dict)
 
 
 # ============ 工具 ============
@@ -283,6 +286,17 @@ def _event_usage(
     pp = personality_cfg.get("pain_point_policy", "triggered_only")
     plan_followup = personality_cfg.get("plan_followup", "once")
 
+    # memory_challenge：用户在挑战"你是不是真的记得"，
+    # 此时所有相关事件类型（含 experience/plan/status_change）都应允许 explicit，
+    # 否则 AI 拿不出任何证据，只能回"我不太确定"。
+    if route.intent == "memory_challenge" and event.event_type in {
+        "plan",
+        "status_change",
+        "achievement",
+        "experience",
+    }:
+        return MemoryUsage.EXPLICIT_OK, "memory_challenge：保留事件供试探性引用"
+
     if event.event_type == "pain_point":
         if pp == "background_only":
             return MemoryUsage.BACKGROUND_ONLY, "痛点：内向人格，仅作背景"
@@ -316,7 +330,34 @@ def _event_usage(
     if event.event_type == "feedback":
         return MemoryUsage.BACKGROUND_ONLY, "反馈：影响回复风格，不主动提"
 
+    if event.event_type == "experience":
+        # self_summary / memory_challenge / relationship_topic 都可能用得到
+        # （上面 memory_challenge 已先返回 explicit，这里覆盖 self_summary）
+        if route.intent == "self_summary":
+            return MemoryUsage.EXPLICIT_OK, "经历：自我总结时直接引用"
+        return MemoryUsage.BACKGROUND_ONLY, "经历：作为背景"
+
     return MemoryUsage.BACKGROUND_ONLY, "一般经历，作为背景"
+
+
+_QUERY_WORD_RE = re.compile(r"[\u4e00-\u9fa5a-zA-Z]{2,}")
+
+
+def _query_keywords(query: str, limit: int = 6) -> list[str]:
+    if not query:
+        return []
+    seen: list[str] = []
+    for w in _QUERY_WORD_RE.findall(query):
+        w = w.strip().lower()
+        if not w or w in seen:
+            continue
+        # 跳过常见的连接词/代词
+        if w in {"我的", "你的", "的话", "的吗", "什么", "怎么", "知道", "记得"}:
+            continue
+        seen.append(w)
+        if len(seen) >= limit:
+            break
+    return seen
 
 
 def _score_event(event: UserEvent, route: MemoryRoute) -> float:
@@ -339,6 +380,13 @@ def _score_event(event: UserEvent, route: MemoryRoute) -> float:
         "feedback",
     }:
         score += 0.15
+    # memory_challenge：按 query 关键词命中加权，让"出差"这种用户当前问的事件冒头
+    if route.intent == "memory_challenge":
+        summary = (event.summary or "").lower()
+        for kw in _query_keywords(route.query):
+            if kw in summary:
+                score += 0.25
+                break
     return score
 
 
@@ -353,6 +401,50 @@ def _search_episodic(user_id: str, query: str, limit: int) -> list[dict]:
         return results.get("results", []) or []
     except Exception as e:
         logger.warning("mem0 search failed: %s", e)
+        return []
+
+
+async def _load_deprecated_episodic_ids(
+    user_id: str, db: AsyncSession
+) -> set[str]:
+    """返回该用户当前处于"停用中"的 episodic mem_id 集合。"""
+    try:
+        from app.models.deprecation import MemoryDeprecation
+
+        result = await db.execute(
+            select(MemoryDeprecation.ref_id).where(
+                MemoryDeprecation.user_id == user_id,
+                MemoryDeprecation.source == "episodic",
+                MemoryDeprecation.action.in_(("deprecate", "update")),
+                MemoryDeprecation.restored_at.is_(None),
+            )
+        )
+        return {str(r) for r in result.scalars().all() if r}
+    except Exception as e:
+        logger.debug("load deprecated episodic ids failed: %s", e)
+        return set()
+
+
+async def _load_banned_entities(
+    user_id: str, db: AsyncSession
+) -> list[str]:
+    """读取该用户当前生效的硬封禁实体词。
+    用于过滤含有这些词的 episodic/event 文本——即使旧数据没被显式 deprecate，
+    含禁用词的记忆也不应再被激活。
+    """
+    try:
+        from app.models.deprecation import MemoryDeprecation
+
+        result = await db.execute(
+            select(MemoryDeprecation.ref_id).where(
+                MemoryDeprecation.user_id == user_id,
+                MemoryDeprecation.source == "entity",
+                MemoryDeprecation.restored_at.is_(None),
+            )
+        )
+        return [str(r) for r in result.scalars().all() if r]
+    except Exception as e:
+        logger.debug("load banned entities failed: %s", e)
         return []
 
 
@@ -384,7 +476,12 @@ async def build_context(
     if "relationships" in route.load_layers or route.intent == "self_summary":
         ctx.relevant_relationships = _extract_relationships(profile_json, route)
 
+    # 提前加载用户被纠错过的硬封禁实体词（events / episodic 都会用）
+    banned_entities = await _load_banned_entities(user_id, db)
+
     # 3) 事件
+    events_total_active = 0
+    events_after_policy = 0
     if "events" in route.load_layers and route.event_policy != "none":
         result = await db.execute(
             select(UserEvent)
@@ -392,7 +489,16 @@ async def build_context(
             .order_by(UserEvent.importance.desc())
             .limit(30)
         )
-        candidates = _select_events_by_policy(list(result.scalars().all()), route)
+        all_active = list(result.scalars().all())
+        # 过滤含禁用实体词的事件（即使 status='active' 也排除）
+        if banned_entities:
+            all_active = [
+                e for e in all_active
+                if not any(b in (e.summary or "") for b in banned_entities)
+            ]
+        events_total_active = len(all_active)
+        candidates = _select_events_by_policy(all_active, route)
+        events_after_policy = len(candidates)
         scored: list[RoutedMemory] = []
         for e in candidates:
             usage, reason = _event_usage(e, route, cfg)
@@ -420,6 +526,11 @@ async def build_context(
         ctx.relevant_events = scored[:3]
 
     # 4) 情节记忆
+    episodic_query = ""
+    episodic_limit = 0
+    episodic_raw_count = 0
+    episodic_filtered_count = 0
+    episodic_filtered_banned = 0
     if "episodic" in route.load_layers:
         if route.intent == "self_summary":
             limit = 6
@@ -427,7 +538,29 @@ async def build_context(
             limit = 5
         else:
             limit = 4
-        raw = _search_episodic(user_id, route.query, limit)
+        episodic_query = route.query or ""
+        # 多检索几条以抵消「停用过滤」造成的减少
+        episodic_limit = limit
+        raw = _search_episodic(user_id, route.query, limit * 2)
+        episodic_raw_count = len(raw)
+        # 过滤已被纠错软删的 episodic
+        deprecated_ids = await _load_deprecated_episodic_ids(user_id, db)
+        if deprecated_ids:
+            before = len(raw)
+            raw = [
+                r for r in raw
+                if str(r.get("id")) not in deprecated_ids
+            ]
+            episodic_filtered_count = before - len(raw)
+        # 过滤含禁用实体词的 episodic（含旧数据，对纠错后的二次污染兜底）
+        if banned_entities:
+            before = len(raw)
+            raw = [
+                r for r in raw
+                if not any(b in (r.get("memory") or "") for b in banned_entities)
+            ]
+            episodic_filtered_banned = before - len(raw)
+        raw = raw[:limit]
         scored_eps: list[RoutedMemory] = []
         for r in raw:
             text = (r.get("memory") or "").strip()
@@ -436,7 +569,8 @@ async def build_context(
             score = float(r.get("score", 0.0) or 0.0)
             usage = MemoryUsage.EXPLICIT_OK
             reason = "情节记忆语义匹配"
-            if route.sensitive_mode:
+            # 敏感场景默认降级，但 memory_challenge 是用户主动邀请记忆，必须保留 explicit
+            if route.sensitive_mode and route.intent != "memory_challenge":
                 usage = MemoryUsage.BACKGROUND_ONLY
                 reason = "敏感场景：情节记忆仅作背景"
             scored_eps.append(
@@ -480,42 +614,124 @@ async def build_context(
         ]
 
     # 6) 显性记忆上限由人格控制（超过部分降级为 background_only）
+    #    必须把 stable_profile 也算进去——之前漏了，self_summary 时会 profile + relationship
+    #    全部 explicit，绕过 cap 把 10 条都塞进 system 段。
     _cap_explicit(
         [
+            *ctx.stable_profile,
             *ctx.relevant_relationships,
             *ctx.relevant_events,
             *ctx.relevant_memories,
         ],
         route.max_explicit_memories,
+        intent=route.intent,
     )
 
-    # 7) 汇总 background_only（含再一次跨层去重，避免在不同 group 中又重复）
-    bg_all: list[RoutedMemory] = []
-    for group in (
-        ctx.relevant_relationships,
-        ctx.relevant_events,
-        ctx.relevant_memories,
-    ):
-        for r in group:
-            if r.usage == MemoryUsage.BACKGROUND_ONLY:
-                bg_all.append(r)
-    bg_dedup = _dedupe_memories(bg_all)
-    # 背景信息最多 3 条，避免 prompt 过长
-    ctx.background_only = bg_dedup[:3]
+    # 7) 汇总 background_only：按 source 分桶，避免某一层（例如关系）把另一层（事件）挤掉。
+    #    之前是 bg_all[:3]，turn#5 那种关系 7 条 background 直接淹没"上周深圳出差"事件。
+    ctx.background_only = _collect_background(ctx)
+
+    # 8) 时点快照统计：供「线上聊天记录评估」做"当时手里有什么"对照。
+    #    只是数字+字符串，不再额外 DB / LLM 调用。
+    ctx.snapshot_stats = {
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "events_total_active": events_total_active,
+        "events_after_policy": events_after_policy,
+        "events_kept_in_context": len(ctx.relevant_events),
+        "episodic_query": episodic_query,
+        "episodic_limit": episodic_limit,
+        "episodic_returned": episodic_raw_count,
+        "episodic_filtered_deprecated": episodic_filtered_count,
+        "episodic_filtered_banned": episodic_filtered_banned,
+        "episodic_kept_in_context": len(ctx.relevant_memories),
+        "relationships_total": len(ctx.relevant_relationships),
+        "profile_stable_total": len(ctx.stable_profile),
+        "banned_entities": banned_entities,
+    }
 
     return ctx
 
 
-def _cap_explicit(items: list[RoutedMemory], cap: int) -> None:
+# 显性记忆排序时各 source 的"基础优先级"。
+# 同 score 时，关系/事件/情节都比纯 profile basic 重要——
+# 比如问"家里有谁"，应该先给妻子/儿子/猫，而不是"姓名/出生年份/所在地"。
+_SOURCE_PRIORITY: dict[str, int] = {
+    "relationship": 4,
+    "event": 3,
+    "episodic": 2,
+    "profile": 1,
+}
+
+
+def _cap_explicit(
+    items: list[RoutedMemory], cap: int, intent: str = ""
+) -> None:
     """把超过 cap 数量的 explicit_ok 记忆降级为 background_only。
     items 中元素与 ctx 子列表共享同一个对象，原地修改即可。
+
+    排序优先级：source 权重在前（关系>事件>情节>profile），其次按 score。
+    self_summary 例外：保留 profile 'name' 字段（"你叫什么"基础事实），
+    确保至少 1 条 profile basic 能进 explicit。
     """
     if cap < 0:
         cap = 0
     explicit = [x for x in items if x.usage == MemoryUsage.EXPLICIT_OK]
-    explicit.sort(key=lambda r: r.score, reverse=True)
-    keep_ids = {id(x) for x in explicit[:cap]}
+
+    keep_ids: set[int] = set()
+
+    # self_summary 时优先把 1 条 profile 姓名条目"占名额"保住
+    # （而不是额外加），自我介绍场景里"你叫 dxj"是最该有的事实
+    if intent == "self_summary" and cap > 0:
+        for x in explicit:
+            if x.source == "profile" and (x.text or "").startswith("姓名"):
+                keep_ids.add(id(x))
+                break
+
+    remaining = max(0, cap - len(keep_ids))
+    others = [x for x in explicit if id(x) not in keep_ids]
+    others.sort(
+        key=lambda r: (_SOURCE_PRIORITY.get(r.source, 0), r.score),
+        reverse=True,
+    )
+    keep_ids.update(id(x) for x in others[:remaining])
+
     for x in items:
         if x.usage == MemoryUsage.EXPLICIT_OK and id(x) not in keep_ids:
             x.usage = MemoryUsage.BACKGROUND_ONLY
             x.reason = (x.reason or "") + "（超过人格显性上限，降级）"
+
+
+def _collect_background(ctx: MemoryContext) -> list[RoutedMemory]:
+    """按 source 分桶聚合 background_only，避免单一层挤占名额。
+
+    桶配额：关系 3 / 事件 3 / 情节 3 / profile 2（profile 已在【稳定背景】段全显示，
+    在此只作 activated 追踪用，所以配额给少一点）。最终总数 cap=9，去重后返回。
+    """
+    by_source: dict[str, list[RoutedMemory]] = {
+        "relationship": [],
+        "event": [],
+        "episodic": [],
+        "profile": [],
+    }
+    for group in (
+        ctx.relevant_relationships,
+        ctx.relevant_events,
+        ctx.relevant_memories,
+        ctx.stable_profile,
+    ):
+        for r in group:
+            if r.usage == MemoryUsage.BACKGROUND_ONLY:
+                key = r.source if r.source in by_source else "episodic"
+                by_source[key].append(r)
+
+    for key in by_source:
+        by_source[key].sort(key=lambda r: r.score, reverse=True)
+
+    merged: list[RoutedMemory] = []
+    merged.extend(by_source["event"][:3])
+    merged.extend(by_source["relationship"][:3])
+    merged.extend(by_source["episodic"][:3])
+    merged.extend(by_source["profile"][:2])
+
+    deduped = _dedupe_memories(merged)
+    return deduped[:9]

@@ -221,7 +221,13 @@ def _contains_any(text: str, keywords: Iterable[str]) -> bool:
 
 
 def _build_query(message: str, history: list[ChatTurn], subjects: list[str]) -> str:
-    recent_user = [t.content for t in history[-6:] if t.role == "user"]
+    """构造 mem0 检索 query。
+
+    只带最近 1 条 user 历史，避免长串把当前句关键名词稀释。
+    历史更早的承接关系交给 `_infer_subjects` 推断的主语来表达；如果连主语
+    都推不出来，那条事实大概率也不属于本轮要召回的范围。
+    """
+    recent_user = [t.content for t in history[-1:] if t.role == "user"]
     parts: list[str] = [message.strip(), *recent_user, *subjects]
     seen: set[str] = set()
     out: list[str] = []

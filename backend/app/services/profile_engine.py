@@ -472,12 +472,13 @@ def extract_facts_from_conversation(messages: list) -> list[dict]:
     )
     try:
         resp = client.chat.completions.create(
-            model=os.getenv("EXTRACT_MODEL", os.getenv("CHAT_MODEL", "qwen-plus")),
+            model=os.getenv("EXTRACT_MODEL", os.getenv("CHAT_MODEL", "qwen3.7-plus")),
             messages=[
                 {"role": "system", "content": EXTRACT_SYSTEM_PROMPT},
                 {"role": "user", "content": conversation_text},
             ],
             temperature=0,
+            extra_body={"enable_thinking": False},
         )
         raw = resp.choices[0].message.content.strip()
         if raw.startswith("```"):

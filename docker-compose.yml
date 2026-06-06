@@ -13,7 +13,9 @@ services:
       - https_proxy=
       - all_proxy=
       - OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-      - CHAT_MODEL=qwen-max
+      - CHAT_MODEL=qwen3.7-max
+      # Qwen3.5+ 是混合思考模型，Max 系列默认开 thinking；流式 chat 不能等思考过程
+      - ENABLE_THINKING=false
       - QDRANT_HOST=qdrant
       - REDIS_URL=redis://redis:6379/0
       - USER_DB_PATH=/app/data/memobot.db
@@ -21,9 +23,12 @@ services:
       - DEV_MODE=${DEV_MODE:-true}
       - EVAL_USER_ID=a0000001-0000-4000-8000-000000000001
       - EVAL_USER_PHONE=13800000001
-      - INTENT_MODEL=qwen-plus
+      - INTENT_MODEL=qwen3.7-plus
       - INTENT_MODEL_TEMPERATURE=0
       - INTENT_CLASSIFIER_ENABLED=true
+      - PROMPT_TIMEZONE=Asia/Shanghai
+      - EVAL_PASS_THRESHOLD=0.85
+      - TZ=Asia/Shanghai
     volumes:
       - ./backend:/app
       - memobot_data:/app/data
@@ -45,8 +50,12 @@ services:
       - https_proxy=
       - all_proxy=
       - OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-      - CHAT_MODEL=qwen-max
-      - EXTRACT_MODEL=qwen-plus
+      # celery 不直接做 chat，但保留同步避免误用
+      - CHAT_MODEL=qwen3.7-max
+      - ENABLE_THINKING=false
+      # 后台事实抽取 / 纠错判别用 plus 即可，性价比更高
+      - EXTRACT_MODEL=qwen3.7-plus
+      - CORRECTION_MODEL=qwen3.7-plus
       - QDRANT_HOST=qdrant
       - REDIS_URL=redis://redis:6379/0
       - USER_DB_PATH=/app/data/memobot.db
@@ -87,8 +96,10 @@ services:
       - https_proxy=
       - all_proxy=
       - OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-      - CHAT_MODEL=qwen-max
-      - EXTRACT_MODEL=qwen-plus
+      - CHAT_MODEL=qwen3.7-max
+      - ENABLE_THINKING=false
+      - EXTRACT_MODEL=qwen3.7-plus
+      - CORRECTION_MODEL=qwen3.7-plus
       - QDRANT_HOST=qdrant
       - REDIS_URL=redis://redis:6379/0
       - USER_DB_PATH=/app/data/memobot.db

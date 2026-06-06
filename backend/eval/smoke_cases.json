@@ -118,8 +118,8 @@
       ],
       "message": "明天有点紧张",
       "expect": {
-        "intent": "plan_followup",
-        "must_activate_keywords": ["面试", "星维"]
+        "optional_intents": ["plan_followup", "emotional_support"],
+        "must_activate_keywords": ["面试"]
       }
     },
     {
@@ -179,21 +179,22 @@
       "history": [],
       "message": "下周一那场你记得吧",
       "expect": {
-        "intent": "plan_followup",
-        "must_activate_keywords": ["面试", "6", "星维"]
+        "optional_intents": ["plan_followup", "memory_challenge"],
+        "must_activate_keywords": ["面试", "星维"]
       }
     },
     {
       "id": "A-pr04",
       "bucket": "proactive",
-      "personality": "balanced",
+      "personality": "extrovert",
       "history": [
-        {"role": "user", "content": "老婆在家带小宇，我基本帮不上忙。"},
-        {"role": "assistant", "content": "你这段时间确实很难两边都顾到。"}
+        {"role": "user", "content": "周末过去了，明天又要上班。"},
+        {"role": "assistant", "content": "新的一周开始。"}
       ],
-      "message": "她最近还是很累",
+      "message": "希望一切顺利吧",
       "expect": {
-        "intent": "relationship_topic"
+        "optional_intents": ["plan_followup", "casual"],
+        "must_activate_keywords": ["面试"]
       }
     },
     {

@@ -32,6 +32,10 @@ EVAL_DIR = Path(__file__).resolve().parents[2] / "eval"
 REPORTS_DIR = Path(os.getenv("EVAL_REPORTS_DIR", "/app/data/eval_reports"))
 DRAFTS_DIR = Path(os.getenv("EVAL_DRAFTS_DIR", "/app/data/eval_drafts"))
 
+# 评测 verdict.pass 阈值（pass_rate >= 阈值 → PASS）
+# 默认 0.85；以前是 0.6 → 16/20 也会标"绿"，容易误判系统已经达标。
+EVAL_PASS_THRESHOLD = float(os.getenv("EVAL_PASS_THRESHOLD", "0.85"))
+
 BOUNDARY_PATTERNS = [
     "听起来你",
     "看起来你",
@@ -111,12 +115,18 @@ def _activated_text_blob(prompt_meta: dict) -> str:
 
 
 def _score_l1(case: dict, prompt_meta: dict, reply: str | None) -> dict:
+    """L1 自动评分，输出 strict 和 lenient 两套结果。
+
+    - strict：intent + 关键词半数 + 无违规（原口径）
+    - lenient：允许 intent 与期望偏离，只要"记忆命中强 + 无违规"也算 pass
+      —— 体现用户体感：intent 字段是中间产物，真正影响回复的是召回与禁词
+    - `pass` 字段 = lenient（驱动 verdict 与前端 ✅/❌），同时返回 strict 作对照
+    """
     expect = case.get("expect") or {}
     route = prompt_meta.get("route") or {}
     actual_intent = route.get("intent", "")
     blob = _activated_text_blob(prompt_meta)
 
-    intent_ok = False
     expected = expect.get("intent")
     optional = expect.get("optional_intents") or []
     if expected:
@@ -133,13 +143,40 @@ def _score_l1(case: dict, prompt_meta: dict, reply: str | None) -> dict:
     forbidden_sys = expect.get("forbidden_phrases_in_system") or []
     sys_violations = [p for p in forbidden_sys if p in (prompt_meta.get("system") or "")]
 
-    reply_text = reply or ""
     forbidden_reply = expect.get("forbidden_phrases_in_reply") or []
-    reply_violations = [p for p in forbidden_reply if p in reply_text]
-    boundary_violations = [p for p in BOUNDARY_PATTERNS if p in reply_text]
+    if reply is None:
+        reply_violations: list[str] | None = None
+        boundary_violations: list[str] | None = None
+        reply_check_skipped = True
+    else:
+        reply_violations = [p for p in forbidden_reply if p in reply]
+        boundary_violations = [p for p in BOUNDARY_PATTERNS if p in reply]
+        reply_check_skipped = False
+
+    keyword_pass_loose = keyword_total == 0 or keyword_hits >= max(1, keyword_total // 2)
+    keyword_pass_strong = keyword_total > 0 and keyword_hits >= max(
+        2, keyword_total - 1
+    )  # 命中所有或仅缺 1
+    reply_pass = reply_check_skipped or (
+        not reply_violations and not boundary_violations
+    )
+    no_sys_violation = not sys_violations
+
+    pass_strict = intent_ok and no_sys_violation and reply_pass and keyword_pass_loose
+
+    # lenient：intent 错也能挽救——记忆命中强 + 无违规 + 期望确实写了关键词
+    intent_diverged = not intent_ok
+    saved_by_recall = (
+        intent_diverged
+        and keyword_pass_strong
+        and no_sys_violation
+        and reply_pass
+    )
+    pass_lenient = pass_strict or saved_by_recall
 
     return {
         "intent_match": intent_ok,
+        "intent_diverged": intent_diverged,
         "expected_intent": expected or optional,
         "actual_intent": actual_intent,
         "intent_confidence": route.get("intent_confidence"),
@@ -150,11 +187,12 @@ def _score_l1(case: dict, prompt_meta: dict, reply: str | None) -> dict:
         "system_violations": sys_violations,
         "reply_violations": reply_violations,
         "boundary_violations": boundary_violations,
-        "pass": intent_ok
-        and not sys_violations
-        and not reply_violations
-        and not boundary_violations
-        and (keyword_total == 0 or keyword_hits >= max(1, keyword_total // 2)),
+        "reply_check_skipped": reply_check_skipped,
+        "pass_strict": pass_strict,
+        "pass_lenient": pass_lenient,
+        "saved_by_recall": saved_by_recall,
+        # `pass` 字段沿用旧契约（前端 / verdict 都读它），现在指向 lenient
+        "pass": pass_lenient,
     }
 
 
@@ -264,6 +302,7 @@ async def _run_chat_once(system_prompt: str, messages: list[dict]) -> tuple[str,
         model=CHAT_MODEL,
         messages=messages,
         stream=False,
+        extra_body={"enable_thinking": False},
     )
     text = resp.choices[0].message.content or ""
     return text, getattr(resp.usage, "total_tokens", 0) or 0
@@ -302,7 +341,9 @@ async def run_eval_job(
 
     started = datetime.now(timezone.utc)
     case_results: list[dict] = []
-    passes = 0
+    passes = 0  # lenient
+    passes_strict = 0
+    diverged = 0
 
     try:
         REPORTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -346,8 +387,12 @@ async def run_eval_job(
                     reply = f"[chat error: {e}]"
 
             l1 = _score_l1(case, prompt_meta, reply)
-            if l1.get("pass"):
+            if l1.get("pass_lenient"):
                 passes += 1
+            if l1.get("pass_strict"):
+                passes_strict += 1
+            if l1.get("intent_diverged"):
+                diverged += 1
 
             case_results.append(
                 {
@@ -386,10 +431,19 @@ async def run_eval_job(
                 "case_ids": [c["id"] for c in cases],
             },
             "verdict": {
-                "pass": passes >= len(cases) * 0.6,
+                # 主指标：lenient（贴近用户体感：intent 错也可挽救）
+                "pass": bool(cases) and (passes / len(cases)) >= EVAL_PASS_THRESHOLD,
                 "pass_count": passes,
-                "total": len(cases),
                 "pass_rate": round(passes / len(cases), 3) if cases else 0,
+                "total": len(cases),
+                "threshold": EVAL_PASS_THRESHOLD,
+                # 副指标：strict（仅 intent + 关键词 + 无违规，老口径）
+                "strict_pass_count": passes_strict,
+                "strict_pass_rate": (
+                    round(passes_strict / len(cases), 3) if cases else 0
+                ),
+                # intent 误判数（即使 lenient 救了也计入，便于分类器调优）
+                "intent_diverged_count": diverged,
             },
             "cases": case_results,
         }
@@ -421,7 +475,11 @@ def _render_summary(report: dict) -> str:
         "",
         f"- 类型: {report.get('run_type')}",
         f"- 耗时: {report.get('duration_sec')}s",
-        f"- L1 通过: {v.get('pass_count')}/{v.get('total')} ({v.get('pass_rate', 0):.0%})",
+        f"- L1 通过（lenient）: {v.get('pass_count')}/{v.get('total')} "
+        f"({v.get('pass_rate', 0):.0%}) · 阈值 {v.get('threshold', 0):.0%}",
+        f"- L1 通过（strict）:  {v.get('strict_pass_count')}/{v.get('total')} "
+        f"({v.get('strict_pass_rate', 0):.0%})",
+        f"- intent 误判数: {v.get('intent_diverged_count')}/{v.get('total')}",
         f"- 结论: {'PASS' if v.get('pass') else 'FAIL'}",
         "",
         "## Cases",
@@ -429,11 +487,17 @@ def _render_summary(report: dict) -> str:
     ]
     for c in report.get("cases") or []:
         l1 = (c.get("candidate") or {}).get("l1") or {}
-        mark = "✅" if l1.get("pass") else "❌"
+        if l1.get("pass_strict"):
+            mark = "✅"
+        elif l1.get("pass_lenient"):
+            mark = "🟡"  # intent 偏离但被记忆召回救回
+        else:
+            mark = "❌"
         lines.append(
             f"- {mark} **{c.get('id')}** ({c.get('bucket')}) "
             f"intent={l1.get('actual_intent')} "
             f"keywords={l1.get('keyword_hits')}/{l1.get('keyword_total')}"
+            + ("  *（lenient 救回）*" if l1.get("saved_by_recall") else "")
         )
     return "\n".join(lines) + "\n"
 

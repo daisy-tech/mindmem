@@ -1,6 +1,13 @@
 # MindMem 1.0 技术设计文档
 
-> 版本：1.1 | 日期：2026-05-24
+> 版本：1.2 | 日期：2026-06-06
+>
+> v1.2 增量：
+> - 新增 `memory_deprecations` 表 + `correction_engine` 模块 → §3.1 / §11
+> - 新增 `chat_audit_v1` 审计文件 + Real-Chat-Eval pipeline → §12
+> - Prompt Composer 全量瘦身（平均 -45% tokens）→ §6.4
+> - LLM 全链路升级至 Qwen3.7（`qwen3.7-max` 聊天 / `qwen3.7-plus` 后台）+ `enable_thinking=false` → §7 / §9.3
+> - Memory Router query 收窄为只取最近 1 句 user 消息（避免历史稀释 Mem0 检索）→ §6.2
 
 ---
 
@@ -222,6 +229,28 @@ created_at  TEXT
 updated_at  TEXT
 ```
 
+**memory_deprecations** *(v1.2 新增)*
+```sql
+id                          INTEGER PK AUTOINCREMENT
+user_id                     TEXT INDEX
+source                      TEXT       -- episodic / event / profile / entity
+ref_id                      TEXT INDEX -- mem0_id / event_id / dimension_path / entity_text
+original_text               TEXT
+reason                      TEXT
+correction_conversation_id  TEXT
+correction_turn_id          TEXT
+llm_confidence              REAL
+action                      TEXT       -- deprecate / update / audit_only
+new_text                    TEXT       -- 仅 action=update 时填
+deprecated_at               DATETIME
+restored_at                 DATETIME   -- 软撤销时填
+```
+
+设计要点：
+- `(user_id, source, ref_id, restored_at IS NULL)` 用作"当前生效的 deprecation"语义查询索引；ORM 层不强制唯一约束，避免重复纠错时报错
+- `source='entity'` 是"被否定的实体词"（用户说"小鹏不是动物"→ banned\_entity=`小鹏`），写入/激活时硬过滤
+- 仅由 `correction_engine.run_cleanup_for_correction()` 写入，主链路代码只读
+
 ---
 
 ## 4. API 设计
@@ -276,6 +305,19 @@ PATCH  /api/events/{id}/archive  -- 归档事件
 GET    /api/conversations              -- 获取会话列表
 GET    /api/conversations/{id}         -- 获取单条会话
 DELETE /api/conversations/{id}         -- 删除会话
+GET    /api/conversations/{id}/audit   -- 导出 chat_audit_v1 JSON (v1.2)
+```
+
+### 4.7 评测实验室 *(v1.2)*
+
+```
+GET    /api/eval/personas              -- 列出可用 persona（合成评测）
+POST   /api/eval/run                   -- 跑合成评测（smoke/full）
+GET    /api/eval/runs                  -- 获取历史评测报告列表
+GET    /api/eval/runs/{run_id}         -- 获取单次评测报告
+
+POST   /api/eval/chat-review/{conv_id} -- 对单个真实会话跑 L0+L1 评估
+GET    /api/eval/chat-review/{conv_id} -- 取已跑过的评估结果（可缓存）
 ```
 
 ---
@@ -286,20 +328,31 @@ DELETE /api/conversations/{id}         -- 删除会话
 
 | 任务名 | 触发时机 | 执行内容 |
 |--------|---------|---------|
-| `extract_and_store_memory` | 对话结束 | 调用 Mem0 存储情节记忆，执行语义去重 |
-| `extract_and_update_profile` | 对话结束 | LLM 提取画像字段，自动冲突处理，写审计日志 |
-| `extract_and_store_events` | 对话结束 | LLM 提取事件，双层去重，更新 mention_count |
+| `extract_and_store_memory` | 对话结束（非 correction intent） | 调用 Mem0 存储情节记忆，执行语义去重；写入前 `banned_entities` 硬过滤 |
+| `extract_and_update_profile` | 对话结束（非 correction intent） | LLM 提取画像字段，自动冲突处理，写审计日志；写入前 `banned_entities` 硬过滤 |
+| `extract_and_store_events` | 对话结束（非 correction intent） | LLM 提取事件，双层去重，更新 mention_count；写入前 `banned_entities` 硬过滤 |
+| **`run_correction_cleanup_task`** *(v1.2 新增)* | 对话结束（intent == correction） | LLM 判断 episodic / event / profile 候选 → 软删除/更新 + 写入 banned entities |
 | `decay_all_profiles` | 每天 03:00 | 遍历所有画像字段，对 30 天未更新字段降低置信度 |
+
+**关键约束**：当本轮 intent == `correction` 时，**跳过 `extract_*`，只跑 `run_correction_cleanup_task`**。  
+原因：用户在纠错时，assistant 的回复里仍可能复述错误事实的相关词。如果照常跑 extract，会把"被纠正的错误"当成"新事实"再学一遍，造成记忆永久污染。
 
 ### 5.2 任务流程（对话结束后）
 
 ```
 StreamingResponse 完成
     │
-    ├── extract_and_store_memory.delay(user_id, messages)
-    ├── extract_and_update_profile.delay(user_id, messages, session_id)
-    └── extract_and_store_events.delay(user_id, messages)
+    ├── if intent == "correction":
+    │       └── run_correction_cleanup_task.delay(user_id, user_msg, assistant_msg,
+    │                                              conv_id, turn_id)
+    │
+    └── else:
+            ├── extract_and_store_memory.delay(user_id, messages)
+            ├── extract_and_update_profile.delay(user_id, messages, session_id)
+            └── extract_and_store_events.delay(user_id, messages)
 ```
+
+详见 §11 在线记忆纠错管线。
 
 ---
 
@@ -437,10 +490,10 @@ class MemoryContext(BaseModel):
 | `correction` | 不是、记错、忘掉 | profile, episodic | focused | avoid_unless_asked |
 | `knowledge_task` | 技术/工具/通用知识问题 | profile_basic | minimal | background_only |
 
-**检索 query 生成**
-- 不只使用当前消息
-- 组合：当前消息 + 最近 3-5 轮上下文 + 已识别人物/主题
-- 例：用户说"她最近还是很累"，最近上下文提到"老婆"，query 应扩展为"妻子、全职带孩子、工作忙、家庭分担、很累"
+**检索 query 生成（v1.2 调整）**
+- **历史窗口收窄为最近 1 句 user 消息**：之前用 3-5 轮 history 拼 query，会把"养了一只猫"这种短而精的关键词稀释到 Mem0 召不回（语义被旁支带偏）
+- 当前 query = `user 当前消息 + 最近 1 条 user 历史（如有）+ 识别出的人物/主题`
+- 例：用户说"她最近还是很累"，最近上下文提到"老婆"，query 仅扩展为"妻子 很累"，**不再附带** "全职带孩子、工作忙、家庭分担" 这类推断词（推断由 Chat 模型在 prompt 里完成，不在检索阶段做）
 
 **规则优先的 intent 打分**
 
@@ -557,40 +610,106 @@ final_score =
 - `events` 每轮最多注入 3 条
 - `episodic` 每轮最多注入 5 条候选，最终可显性使用数量仍受人格限制
 
-### 6.4 Prompt 编排
+### 6.4 Prompt 编排（v1.2 瘦身版）
 
-Memory Router 输出后，Prompt 不再简单拼接完整画像/事件/记忆，而是按使用策略分区。
+Memory Router 输出后，Prompt 不再简单拼接完整画像/事件/记忆，而是按使用策略分区。**v1.2 全量瘦身**，平均 prompt 长度从 ~2200 字 / ~3300 tokens 降至 ~1000 字 / ~1500 tokens（**节省 ~45%**）。
+
+**分区结构（按 intent 动态渲染，空块直接省略）**
 
 ```text
-【稳定背景】
-- 只放低敏、长期稳定信息
+{BASE_PERSONA}          # ~200 字，人设 + 6 类禁用句式
 
-【当前相关记忆】
-- 最多 N 条，N 由人格决定
-- 可显性提及
+【当前时间】2026-06-06 22:54 · 晚上 · 周六
 
-【背景信息（不要主动说出）】
-- 痛点、压力、敏感关系、反馈等
+【你已知关于用户的事】（仅供理解，不主动复述）        # stable_profile，空则省
+- ...
 
-【可轻跟进事件】
-- 仅放符合时间窗口且未跟进过的事件
+【本轮可以提及的具体记忆】                              # explicit_pool，空则省
+- ...
 
-【本轮使用规则】
-- 哪些可以明说
-- 哪些只能影响语气和判断
+【可轻问一次的近期事件】（不要列清单）                   # follow_up_once，空则省
+- ...
+
+【你大致还记得这些（默认不主动说出）】                   # background_only，空则省
+- ...
+
+【本轮】                                                # 只剩对 LLM 真正有用的最小集
+- 意图：{intent_label}；人格：{persona_tone}
+- 显性记忆最多 {max_explicit_memories} 条
+- [可选] 敏感场景：承接当下感受，不主动翻旧账
+
+{INTENT_GUIDES[intent]}  # 一次只注入一条；按 intent 选
+
+≪硬边界（不可破）≫
+- 不编造任何记忆里没有的事实；不替用户/关系人推断心理状态
+- 不主动暴露健康/财务/家庭矛盾等敏感信息；不连续提同一痛点
+- 敏感场景（情绪/纠错/质问）下：人格"主动性"被覆盖
 ```
 
-SSE `type=prompt` 中除原始 system prompt 外，应逐步增加结构化字段，供 Prompt 透明面板展示：
+**瘦身的关键决策**
+
+| 决策 | 原因 |
+|---|---|
+| 整段删除 `BACKGROUND_USAGE_RULES`（350 字） | 其规则已分散到 BASE_PERSONA "不主动复述" + memory_challenge 指引 + HARD_RULES 三处，删除避免重复 |
+| `INTENT_GUIDES[correction]` 700 → 350 字 | 合并"硬性输出结构 / 强禁止 / 后续处理"三段，去掉重复 ✅/❌ 示例 |
+| 空块（stable/explicit/followup/background）不再渲染"（无）" | 减少噪音，让 LLM 把注意力放在有内容的块上 |
+| 本轮规则去掉 `intent_id`/`memory_depth`/`personality_label`/`event_policy` | 这些只对调试有用，对生成无意义；仍完整保留在 `prompt_meta.route` 供前端展示 |
+
+**特定 intent 关键约束（一字不丢）**
+
+| intent | 不可缺失的约束 |
+|---|---|
+| `correction` | 第一人称承认 + **复述用户给出的正确事实** + 整段禁止再次提及被纠正实体词 + 后续自然停下 |
+| `memory_challenge` | "池里没有的实体绝不能说"、"只有 1 条相关时只复述这 1 条" |
+| `emotional_support` | 一句话承接具体画面、禁通用建议（深呼吸/早点睡） |
+| `casual` | 不主动提具体旧记忆 |
+| `knowledge_task` | 直接答、不带个人记忆 |
+
+**SSE prompt 事件结构**
+
+SSE `type=prompt` 中除原始 system prompt 外，提供完整 `prompt_meta`：
 
 ```json
 {
   "type": "prompt",
-  "route": {"intent": "relationship_topic", "memory_depth": "focused"},
+  "version": "turn_meta_v1",
+  "system": "<system prompt 字符串>",
+  "memories": ["兼容旧前端的扁平 memory 列表"],
+  "route": {
+    "intent": "relationship_topic",
+    "intent_confidence": 0.86,
+    "intent_source": "classifier",
+    "low_confidence": false,
+    "memory_depth": "focused",
+    "personality": "balanced",
+    "sensitive_mode": false,
+    "max_explicit_memories": 2,
+    "query": "妻子 很累",
+    "reasons": ["classifier: 代词指向妻子 (conf=0.86)"],
+    "router_version": "v1.5"
+  },
   "activated": [
-    {"source": "relationship", "text": "妻子全职在家带孩子", "usage": "explicit_ok", "reason": "用户用代词'她'并延续妻子话题"}
-  ]
+    {"source": "relationship", "text": "妻子全职带孩子", "usage": "explicit_ok",
+     "reason": "用户用代词'她'延续妻子话题", "score": 0.84}
+  ],
+  "context_layers": {
+    "stable_profile": [...],
+    "relevant_relationships": [...],
+    "relevant_events": [...],
+    "relevant_memories": [...],
+    "background_only": [...]
+  },
+  "snapshot_stats": {
+    "episodic_total": 12,
+    "episodic_filtered_deprecated": 1,
+    "episodic_filtered_banned": 0,
+    "events_filtered_banned": 0,
+    "banned_entities": []
+  }
 }
 ```
+
+`snapshot_stats` 是真实聊天评估的核心字段，详见 §12。
 
 ### 6.5 事件记忆使用策略
 
@@ -660,34 +779,7 @@ context = await memory_context_builder.build(route, db)
 system_prompt, prompt_meta = prompt_composer.compose(context)
 ```
 
-**Prompt 透明面板**
-
-SSE `type=prompt` 除保留原始 system prompt 外，应增加结构化路由信息：
-
-```json
-{
-  "type": "prompt",
-  "route": {
-    "intent": "relationship_topic",
-    "memory_depth": "focused",
-    "personality": "balanced"
-  },
-  "activated": [
-    {
-      "source": "relationship",
-      "text": "妻子全职在家带孩子",
-      "usage": "explicit_ok",
-      "reason": "用户使用代词'她'，最近上下文是妻子话题"
-    },
-    {
-      "source": "event",
-      "text": "妻子在家带孩子很辛苦",
-      "usage": "background_only",
-      "reason": "该事件属于 pain_point，只作背景"
-    }
-  ]
-}
-```
+**Prompt 透明面板**：SSE `type=prompt` 的完整结构见 §6.4 末尾。
 
 ### 6.7 v1 非目标
 
@@ -703,17 +795,37 @@ SSE `type=prompt` 除保留原始 system prompt 外，应增加结构化路由�
 
 ## 7. LLM 使用策略
 
-| 场景 | 模型 | 原因 |
-|------|------|------|
-| 对话生成 | qwen-max | 语言质量要求高，需要自然表达 |
-| **记忆 intent 分类（v1.5）** | **qwen-plus / qwen-turbo** | **仅输出 intent JSON，temperature=0，与 Chat 隔离** |
-| 画像提取 | qwen-plus | 结构化 JSON 输出，质量优先（关系/事件抽取易出错） |
-| 事件提取 | qwen-plus | 结构化 JSON 输出，质量优先 |
-| 情节记忆候选提取 | qwen-plus | 高频任务，质量和成本平衡 |
-| 情节记忆合并 | qwen-plus | 高频但输入短，用于合并相似记忆 |
-| 手动记忆压缩 | qwen-max | 低频关键清洗，质量优先 |
-| 手动社会关系清洗 | qwen-max | 低频关键清洗，降低推断/编造概率 |
-| 对话标题生成 | 规则截取首条用户消息 | 当前实现未单独调用 LLM |
+### 7.1 模型分配（v1.2 升级到 Qwen3.7）
+
+| 场景 | 模型 | enable_thinking | 原因 |
+|------|------|---|------|
+| 对话生成 | `qwen3.7-max` | **false** | 流式聊天延迟敏感，thinking 模式会让首字 token 延迟到 1.5s+ |
+| 记忆 intent 分类 | `qwen3.7-plus` | **false** | 仅输出 JSON，temperature=0，与 Chat 隔离 |
+| 画像提取 | `qwen3.7-plus` | **false** | 结构化 JSON 输出 |
+| 事件提取 | `qwen3.7-plus` | **false** | 结构化 JSON 输出 |
+| 情节记忆候选提取 | `qwen3.7-plus` | **false** | 高频任务 |
+| 情节记忆合并 | `qwen3.7-plus` | **false** | 高频但输入短 |
+| **纠错判断（v1.2 新增）** | `qwen3.7-plus` | **false** | 小模型 JSON 决策候选记忆的 action |
+| 手动记忆压缩 | `qwen3.7-max` | **false** | 低频关键清洗 |
+| 手动社会关系清洗 | `qwen3.7-max` | **false** | 低频关键清洗 |
+| 评测 Judge | `qwen3.7-plus` | **false** | L1 启发式为主，LLM Judge 暂未启用 |
+| 对话标题生成 | 规则截取首条用户消息 | — | 未单独调用 LLM |
+
+### 7.2 enable_thinking 关键说明
+
+Qwen3.7 系列默认是 **hybrid thinking model**，开启 thinking 会产出 `<think>...</think>` 段且首字延迟显著。MindMem 所有 LLM 调用统一显式传 `extra_body={"enable_thinking": False}`：
+
+```python
+client.chat.completions.create(
+    model=os.getenv("EXTRACT_MODEL", "qwen3.7-plus"),
+    messages=[...],
+    extra_body={"enable_thinking": False},  # ← 必填
+)
+```
+
+涉及文件：`chat.py`、`intent_classifier.py`、`celery_worker.py`、`correction_engine.py`、`profile_engine.py`、`event_engine.py`、`eval_runner.py`、`compact_memories.py`、`clean_relationships.py`。
+
+环境变量级别也提供 `ENABLE_THINKING=false`，便于运维一键切换（默认 false）。
 
 ---
 
@@ -770,8 +882,12 @@ frontend ──→ backend ──→ qdrant
 |--------|-------|------|
 | OPENAI_API_KEY | - | DashScope API Key（必填） |
 | OPENAI_BASE_URL | dashscope.aliyuncs.com | API 接入点 |
-| CHAT_MODEL | qwen-max | 对话模型 |
-| EXTRACT_MODEL | qwen-plus | 提取模型 |
+| **CHAT_MODEL** | `qwen3.7-max` | 对话模型（v1.2 升级） |
+| **INTENT_MODEL** | `qwen3.7-plus` | 意图分类模型（v1.2 升级） |
+| **EXTRACT_MODEL** | `qwen3.7-plus` | 画像/事件/记忆提取模型（v1.2 升级） |
+| **CORRECTION_MODEL** | `qwen3.7-plus` | 纠错判断模型（v1.2 新增） |
+| **ENABLE_THINKING** | `false` | 全局关闭 Qwen3.7 thinking 模式，避免首字延迟 |
+| **PROMPT_TIMEZONE** | `Asia/Shanghai` | Prompt 中"当前时间"的时区 |
 | JWT_SECRET | memobot-dev-secret | JWT 签名密钥（生产必须修改） |
 | REDIS_URL | redis://redis:6379/0 | Celery Broker |
 | QDRANT_HOST | qdrant | Qdrant 服务地址 |
@@ -798,3 +914,188 @@ frontend ──→ backend ──→ qdrant
 ### 10.4 为什么画像冲突不需要用户确认？
 
 AI 伴侣场景下用户不应被频繁打扰确认信息。三类字段策略（累加/覆盖/合并）覆盖 95% 以上更新场景，审计日志提供事后透明度。
+
+### 10.5 为什么纠错走"软删除 + Tombstone"而不是物理删除？
+
+- **可审计**：用户事后想找"为什么这条记忆被删了"，可在 `memory_deprecations` 找到原文 + 原因 + 触发会话
+- **可回滚**：`restored_at` 字段支持"撤销纠错"
+- **避免误删**：LLM 判断有 confidence，低于阈值的只 `audit_only`，不动数据
+- **跨层一致**：episodic 在 Mem0 没有简单的"标 tombstone"接口，统一在 SQLite 集中管理 deprecation 列表，主链路只读
+
+### 10.6 为什么 Qwen3.7 需要显式 `enable_thinking=false`？
+
+Qwen3.7 系列默认开启 thinking 模式，会先输出一段 `<think>…</think>` 推理过程再给最终答案。在流式聊天场景下首字延迟会从 ~500ms 涨到 1.5-3s，严重影响体感；后台抽取任务也会让 JSON 解析失败率升高。统一显式关掉。
+
+---
+
+## 11. 在线记忆纠错管线 *(v1.2)*
+
+详见 [Correction-Pipeline.md](./Correction-Pipeline.md)。本节给出关键集成点。
+
+### 11.1 流程图
+
+```text
+用户："你记错了，小鹏不是动物，是儿子的同学"
+        │
+        ▼ (chat.py)
+Layer 2 分类器 → intent=correction (confidence=0.94)
+        │
+        ▼
+prompt_composer 注入【纠错指引】(强制：第一人称承认 + 复述用户事实)
+        │
+        ▼
+Chat 模型生成回复："记错了，小鹏是儿子的同学，不是宠物，我按这个来。"
+        │
+        ▼ (chat.py 流式结束)
+if intent == "correction":
+    run_correction_cleanup_task.delay(user_id, user_msg, asst_msg, conv_id, turn_id)
+    # ↑ 关键：跳过 extract_*，避免再学错
+        │
+        ▼ (celery_worker)
+correction_engine.run_cleanup_for_correction():
+  ├── 提取纠错目标 token（用户/asst 文本去停用词）
+  ├── 多 token 检索 episodic / event / profile 候选
+  ├── LLM 判断 → {actions: [...], banned_entities: [...]}
+  ├── 写入 memory_deprecations 表（episodic/event/profile/entity 四种 source）
+  └── profile 同步追加 interaction_history.user_corrections
+        │
+        ▼ (下次对话)
+memory_context.build():
+  ├── 读 deprecated_episodic_ids → 过滤 Mem0 召回结果
+  ├── 读 banned_entities → 过滤含 banned 实体的 episodic / event
+  └── snapshot_stats 记录"过滤了多少"
+```
+
+### 11.2 涉及的代码模块
+
+| 文件 | 职责 |
+|---|---|
+| `backend/app/models/deprecation.py` | `MemoryDeprecation` ORM |
+| `backend/app/services/correction_engine.py` | 候选检索 + LLM 判断 + 三层 apply + banned 写入 |
+| `backend/celery_worker.py` | `run_correction_cleanup_task` + extract\_\* 加 banned 过滤 |
+| `backend/app/routers/chat.py` | `intent == correction` 时跳过 extract\_\* |
+| `backend/app/services/memory_context.py` | 读 deprecated/banned 做硬过滤 + 写 snapshot_stats |
+| `backend/app/services/prompt_composer.py` | 注入 `INTENT_GUIDES[correction]` |
+| `backend/scripts/selftest_p0.py` | `test_correction_engine_pure` 测试集 |
+
+### 11.3 LLM 判断 schema
+
+```python
+class CorrectionLLMOutput(TypedDict):
+    actions: list[CorrectionAction]
+    banned_entities: list[str]   # 用户明确否定的实体词
+
+class CorrectionAction(TypedDict):
+    ref_id: str
+    source: str                  # episodic / event / profile
+    action: str                  # keep / deprecate / update / audit_only
+    new_text: str | None         # 仅 action=update 时填
+    confidence: float            # 0.0 - 1.0
+    reason: str
+```
+
+- LLM 模型：`CORRECTION_MODEL`（默认 `qwen3.7-plus`）
+- `temperature=0` + `response_format={"type":"json_object"}` + `extra_body={"enable_thinking": False}`
+- `confidence ≥ 0.6` 才落库；`audit_only` 永远只写 audit 不动数据
+
+### 11.4 Banned Entities 工作机制
+
+被否定的实体写入 `memory_deprecations(source='entity', ref_id=<entity_text>)`，主链路有两处使用：
+
+| 使用点 | 行为 |
+|---|---|
+| `memory_context._load_banned_entities()` | 召回时过滤命中 banned 的 episodic 和 event |
+| `celery_worker.extract_*` 写入前 | 过滤命中 banned 的新提取候选，避免下轮再写入 |
+
+辅助函数：`correction_engine.load_banned_entities(user_id, db)` / `text_hits_banned(text, banned)`。
+
+---
+
+## 12. 真实聊天评估 Pipeline *(v1.2)*
+
+详见 [Real-Chat-Eval.md](./Real-Chat-Eval.md)。本节给出技术骨架。
+
+### 12.1 数据模型
+
+每条 assistant 消息在写库时携带一份 `prompt_meta`（详见 §6.4），关键字段：
+
+```jsonc
+{
+  "version": "turn_meta_v1",
+  "route": { ... },
+  "activated": [ ... ],
+  "context_layers": { stable_profile, relevant_relationships, ... },
+  "snapshot_stats": {
+    "episodic_total": 12,
+    "episodic_filtered_deprecated": 1,
+    "episodic_filtered_banned": 0,
+    "events_filtered_banned": 0,
+    "banned_entities": []
+  }
+}
+```
+
+评估时**只读** assistant 消息里的 `prompt_meta`，不需要重放 Memory Router → 评估成本 ≈ 0 token（除 LLM judge 规则外，启发式规则为本地 Python）。
+
+### 12.2 模块清单
+
+| 文件 | 职责 |
+|---|---|
+| `backend/app/services/chat_audit.py` | 把会话 + 每轮 prompt_meta 拼成 `chat_audit_v1` JSON |
+| `backend/app/services/eval_chat_review.py` | L1 启发式规则集（10+ 条），输入 audit pack，输出 review pack |
+| `backend/app/routers/eval.py` | API `POST /api/eval/chat-review/{conversation_id}` |
+| `backend/app/routers/conversations.py` | 导出 `chat_audit_v1` JSON |
+| `frontend/src/views/EvalView.vue` + `EvalQueryPanel.vue` | 评测实验室 UI，新增「线上聊天记录」Tab |
+
+### 12.3 L1 启发式规则（v1.2 列出当前 10 条）
+
+| 规则 ID | 描述 | 实现思路 |
+|---|---|---|
+| `reply_off_topic` | 回复与用户问题主题脱节 | 用户问句关键 token 在 reply 里的覆盖率 < 30% |
+| `recall_for_challenge` | 用户质问记忆时，AI 引用了池里实体 | 检查 reply 是否提到 `activated` 中的实体 |
+| `data_vs_activation_gap` | 数据库里有但本轮没激活 | 比 `context_layers` 与 `activated` 的差集 |
+| `fabrication_under_challenge` | 质问时 AI 编造池外实体 | reply 中提到的实体不在 `context_layers` 任何一层 |
+| `correction_persisted` | 上一轮被纠正的实体仍在本轮 `context_layers` | 跨轮检查（用 `prev_turn` 入参） |
+| `correction_no_concrete_ack` | 纠错时 AI 含糊承认/推卸 | 命中 `_CORRECTION_DEFLECT_PHRASES` |
+| `forbidden_phrases_in_reply` | 客服腔/卖萌/鸡汤 | 与 `BASE_PERSONA` 禁用句式表同源 |
+| `sensitive_unsolicited` | 敏感记忆未被询问就主动提 | 用户消息不含 trigger 词，但 reply 提了 background_only 条目 |
+| `relationship_subject_inferred` | 代词消解错 | reply 把"她"指向了错误关系人 |
+| `followup_overflow` | 单轮 follow-up 事件 > 1 | 数 `activated` 里 `usage=follow_up_once` 的条数 |
+
+### 12.4 API
+
+```
+GET    /api/conversations/{id}/audit       -- 导出 chat_audit_v1 JSON
+POST   /api/eval/chat-review/{id}          -- 跑 L0+L1 评估，返回 review pack
+GET    /api/eval/chat-review/{id}          -- 取已跑过的 review（可选缓存）
+```
+
+### 12.5 评估输出
+
+```jsonc
+{
+  "version": "eval_review_v1",
+  "conversation_id": "...",
+  "turns": [
+    {
+      "turn_id": "...",
+      "user": "...",
+      "assistant": "...",
+      "l0": {"ok": true, "missing": []},
+      "l1": [
+        {"rule": "correction_persisted", "severity": "high",
+         "msg": "上一轮纠正的实体「小鹏」仍出现在本轮 background_only"}
+      ],
+      "attribution": "上一轮 correction cleanup 未生效"
+    }
+  ],
+  "summary": {"high": 1, "medium": 2, "low": 0, "total_turns": 8}
+}
+```
+
+### 12.6 成本与触发策略
+
+- 评估**不自动触发**，用户在 EvalView 主动点击「评估」按钮
+- 评估本身是纯 Python，**0 LLM 调用**（启发式 + audit pack）
+- 报告可被导出，下次相同 conv 不重跑（前端缓存）
+- 后续如引入 LLM Judge（v1.3 规划），仅对启发式标红的 turn 调 LLM，控制成本

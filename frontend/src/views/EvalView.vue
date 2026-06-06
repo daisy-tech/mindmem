@@ -97,6 +97,14 @@
             <span v-if="r.verdict?.pass_rate != null">
               {{ Math.round((r.verdict.pass_rate ?? 0) * 100) }}%
             </span>
+            <span
+              v-if="r.verdict?.strict_pass_rate != null
+                && r.verdict.strict_pass_rate !== r.verdict.pass_rate"
+              class="strict-rate"
+              title="strict 通过率（仅 intent 精确命中算过）"
+            >
+              · 严格 {{ Math.round((r.verdict.strict_pass_rate ?? 0) * 100) }}%
+            </span>
             <span class="run-type">{{ r.run_type }}</span>
           </div>
           <div class="run-time">{{ formatTime(r.started_at) }}</div>
@@ -119,8 +127,32 @@
             <el-tag :type="currentReport.verdict?.pass ? 'success' : 'danger'">
               {{ currentReport.verdict?.pass ? 'PASS' : 'FAIL' }}
             </el-tag>
-            <span>
-              L1 通过 {{ currentReport.verdict?.pass_count }}/{{ currentReport.verdict?.total }}
+            <span class="metric">
+              <strong>宽松</strong>
+              {{ currentReport.verdict?.pass_count }}/{{ currentReport.verdict?.total }}
+              <span class="metric-rate">
+                ({{ Math.round((currentReport.verdict?.pass_rate ?? 0) * 100) }}%)
+              </span>
+            </span>
+            <span
+              v-if="currentReport.verdict?.strict_pass_count != null"
+              class="metric"
+            >
+              <strong>严格</strong>
+              {{ currentReport.verdict.strict_pass_count }}/{{ currentReport.verdict?.total }}
+              <span class="metric-rate">
+                ({{ Math.round((currentReport.verdict.strict_pass_rate ?? 0) * 100) }}%)
+              </span>
+            </span>
+            <span
+              v-if="currentReport.verdict?.intent_diverged_count != null
+                && currentReport.verdict.intent_diverged_count > 0"
+              class="metric diverged"
+            >
+              intent 偏离 {{ currentReport.verdict.intent_diverged_count }}/{{ currentReport.verdict?.total }}
+            </span>
+            <span v-if="currentReport.verdict?.threshold != null" class="threshold">
+              阈值 {{ Math.round((currentReport.verdict.threshold ?? 0) * 100) }}%
             </span>
             <span v-if="currentReport.models?.run_chat">含 Chat 回复</span>
             <span v-else>仅 route-preview（无 Chat 调用）</span>
@@ -135,6 +167,15 @@
             >
               下载到本地
             </el-button>
+          </div>
+
+          <div class="legend">
+            <el-tag type="success" size="small" effect="plain">✓</el-tag>
+            <span>严格通过</span>
+            <el-tag type="warning" size="small" effect="plain">🟡</el-tag>
+            <span>intent 偏离但记忆召回救回（lenient pass）</span>
+            <el-tag type="danger" size="small" effect="plain">✗</el-tag>
+            <span>失败</span>
           </div>
 
           <el-table
@@ -154,14 +195,14 @@
                 {{ row.candidate?.l1?.actual_intent || '—' }}
               </template>
             </el-table-column>
-            <el-table-column label="L1" width="70" align="center">
+            <el-table-column label="L1" width="80" align="center">
               <template #default="{ row }">
                 <el-tag
-                  :type="row.candidate?.l1?.pass ? 'success' : 'danger'"
+                  :type="caseTagType(row.candidate?.l1)"
                   size="small"
                   effect="plain"
                 >
-                  {{ row.candidate?.l1?.pass ? '✓' : '✗' }}
+                  {{ caseTagText(row.candidate?.l1) }}
                 </el-tag>
               </template>
             </el-table-column>
@@ -179,6 +220,10 @@
 
       <el-tab-pane label="单条调试" name="query">
         <EvalQueryPanel />
+      </el-tab-pane>
+
+      <el-tab-pane label="线上聊天记录" name="chat">
+        <EvalChatPanel />
       </el-tab-pane>
     </el-tabs>
 
@@ -219,11 +264,42 @@
             <div v-if="activeCase.candidate?.l1" class="expect-block">
               <div class="label">L1 自动判分</div>
               <ul class="l1-list">
-                <li>intent: {{ activeCase.candidate.l1.actual_intent }}
-                  {{ activeCase.candidate.l1.intent_match ? '✓' : '✗' }}</li>
-                <li>keywords: {{ activeCase.candidate.l1.keyword_hits }}/{{ activeCase.candidate.l1.keyword_total }}</li>
+                <li>
+                  intent: {{ activeCase.candidate.l1.actual_intent }}
+                  {{ activeCase.candidate.l1.intent_match ? '✓' : '✗' }}
+                  <span
+                    v-if="activeCase.candidate.l1.intent_source"
+                    class="muted"
+                  >
+                    （{{ activeCase.candidate.l1.intent_source }}
+                    <template v-if="activeCase.candidate.l1.intent_confidence != null">
+                      · {{ Math.round((activeCase.candidate.l1.intent_confidence ?? 0) * 100) }}%
+                    </template>）
+                  </span>
+                </li>
+                <li>
+                  keywords:
+                  {{ activeCase.candidate.l1.keyword_hits }}/{{ activeCase.candidate.l1.keyword_total }}
+                </li>
+                <li>
+                  严格: <strong>{{ activeCase.candidate.l1.pass_strict ? '通过' : '未通过' }}</strong>
+                  · 宽松:
+                  <strong>{{ activeCase.candidate.l1.pass_lenient ? '通过' : '未通过' }}</strong>
+                  <el-tag
+                    v-if="activeCase.candidate.l1.saved_by_recall"
+                    type="warning"
+                    size="small"
+                    effect="plain"
+                    style="margin-left: 6px"
+                  >
+                    🟡 召回救回
+                  </el-tag>
+                </li>
                 <li v-if="activeCase.candidate.l1.boundary_violations?.length">
                   边界违规: {{ activeCase.candidate.l1.boundary_violations.join(', ') }}
+                </li>
+                <li v-if="activeCase.candidate.l1.reply_check_skipped" class="muted">
+                  reply 检查已跳过（未调用 Chat）
                 </li>
               </ul>
             </div>
@@ -274,10 +350,26 @@ import { ElMessage } from 'element-plus'
 import type { UploadRawFile } from 'element-plus'
 import PromptChainPanel from '../components/PromptChainPanel.vue'
 import EvalQueryPanel from '../components/EvalQueryPanel.vue'
+import EvalChatPanel from '../components/EvalChatPanel.vue'
 import {
   useEvalStore,
+  type EvalCaseL1,
   type EvalCaseResult,
 } from '../stores/eval'
+
+function caseTagType(l1?: EvalCaseL1 | null): 'success' | 'warning' | 'danger' {
+  if (!l1) return 'danger'
+  if (l1.pass_strict) return 'success'
+  if (l1.pass_lenient) return 'warning'
+  return 'danger'
+}
+
+function caseTagText(l1?: EvalCaseL1 | null): string {
+  if (!l1) return '✗'
+  if (l1.pass_strict) return '✓'
+  if (l1.pass_lenient) return '🟡'
+  return '✗'
+}
 
 const evalStore = useEvalStore()
 const { runs, currentReport, jobStatus, loading } = storeToRefs(evalStore)
@@ -632,9 +724,42 @@ watch(caseDrawerVisible, (v) => {
   display: flex;
   align-items: center;
   gap: 16px;
-  margin-bottom: 16px;
+  margin-bottom: 8px;
   font-size: 13px;
   color: #606266;
+  flex-wrap: wrap;
+}
+.summary-bar .metric strong {
+  color: #303133;
+  margin-right: 4px;
+}
+.summary-bar .metric-rate {
+  color: #909399;
+  margin-left: 2px;
+}
+.summary-bar .metric.diverged {
+  color: #e6a23c;
+}
+.summary-bar .threshold {
+  font-size: 12px;
+  color: #909399;
+}
+.legend {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 16px;
+  font-size: 12px;
+  color: #909399;
+  flex-wrap: wrap;
+}
+.strict-rate {
+  font-size: 11px;
+  color: #909399;
+}
+.l1-list .muted {
+  color: #909399;
+  font-size: 11px;
 }
 .case-nav {
   display: flex;

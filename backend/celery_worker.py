@@ -123,12 +123,13 @@ def _extract_candidates(messages: list) -> list[str]:
     )
     try:
         resp = client.chat.completions.create(
-            model=os.getenv("EXTRACT_MODEL", "qwen-plus"),
+            model=os.getenv("EXTRACT_MODEL", "qwen3.7-plus"),
             messages=[
                 {"role": "system", "content": CANDIDATE_EXTRACT_PROMPT},
                 {"role": "user", "content": text},
             ],
             temperature=0,
+            extra_body={"enable_thinking": False},
         )
         raw = resp.choices[0].message.content.strip()
         if raw.startswith("```"):
@@ -150,12 +151,13 @@ def _llm_merge(old_text: str, new_text: str) -> str:
             base_url=os.getenv("OPENAI_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
         )
         resp = client.chat.completions.create(
-            model=os.getenv("EXTRACT_MODEL", "qwen-plus"),
+            model=os.getenv("EXTRACT_MODEL", "qwen3.7-plus"),
             messages=[
                 {"role": "system", "content": MERGE_MEMORY_PROMPT},
                 {"role": "user", "content": f"旧记忆：{old_text}\n新增信息：{new_text}"},
             ],
             temperature=0,
+            extra_body={"enable_thinking": False},
         )
         merged = (resp.choices[0].message.content or "").strip()
         merged = merged.strip("`\"' ")
@@ -205,6 +207,12 @@ def _check_and_store(engine: Mem0Engine, user_id: str, text: str):
 @celery_app.task
 def extract_and_store_memory(user_id: str, messages: list):
     """对话结束后，去重后写入情节记忆"""
+    import sqlite3
+    from app.services.correction_engine import (
+        load_banned_entities,
+        text_hits_banned,
+    )
+
     engine = _get_engine()
 
     candidates = _extract_candidates(messages)
@@ -214,10 +222,22 @@ def extract_and_store_memory(user_id: str, messages: list):
         logger.info("[mem] no candidates extracted, skip writing")
         return
 
-    stats = {"skip": 0, "update": 0, "add": 0, "error": 0}
+    # 读取该用户当前生效的"被纠错过的实体"硬封禁列表
+    banned: list[str] = []
+    try:
+        with sqlite3.connect(_get_db_path()) as _conn:
+            banned = load_banned_entities(_conn, user_id)
+    except Exception as e:
+        logger.warning("[mem] load banned entities failed: %s", e)
+
+    stats = {"skip": 0, "update": 0, "add": 0, "error": 0, "blocked_by_banned": 0}
     for raw in candidates:
         text = _strip_subject_prefix(str(raw or ""))
         if not text:
+            continue
+        if text_hits_banned(text, banned):
+            logger.info("[mem] block (banned entity hit): %s", text[:60])
+            stats["blocked_by_banned"] += 1
             continue
         action = _check_and_store(engine, user_id, text)
         stats[action] = stats.get(action, 0) + 1
@@ -269,6 +289,11 @@ def extract_and_store_events(user_id: str, messages: list):
                 return {"id": row[0], "mention_count": row[1], "event_type": row[2]}
         return None
 
+    from app.services.correction_engine import (
+        load_banned_entities,
+        text_hits_banned,
+    )
+
     current_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     new_events = extract_events_from_conversation(messages, current_date)
     if not new_events:
@@ -278,11 +303,15 @@ def extract_and_store_events(user_id: str, messages: list):
     db_path = _get_db_path()
     conn = sqlite3.connect(db_path)
     now = _now_iso()
+    banned = load_banned_entities(conn, user_id)
 
     try:
         for ev in new_events:
             summary = ev.get("summary", "").strip()
             if not summary:
+                continue
+            if text_hits_banned(summary, banned):
+                logger.info("[events] block (banned entity): %s", summary[:60])
                 continue
 
             event_type = ev.get("event_type", "experience")
@@ -365,6 +394,11 @@ def extract_and_update_profile(user_id: str, messages: list):
         apply_facts_to_profile,
     )
 
+    from app.services.correction_engine import (
+        load_banned_entities,
+        text_hits_banned,
+    )
+
     facts = extract_facts_from_conversation(messages)
     if not facts:
         return
@@ -374,6 +408,20 @@ def extract_and_update_profile(user_id: str, messages: list):
     try:
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
+        banned = load_banned_entities(conn, user_id)
+        if banned:
+            before = len(facts)
+            facts = [
+                f for f in facts
+                if not text_hits_banned(str(f.get("value", "")), banned)
+            ]
+            if len(facts) < before:
+                logger.info(
+                    "[profile] blocked %d facts by banned entities (user=%s)",
+                    before - len(facts), user_id,
+                )
+        if not facts:
+            return
 
         # 读取或初始化画像
         cur.execute("SELECT profile_json FROM user_profiles WHERE user_id = ?", (user_id,))
@@ -410,6 +458,31 @@ def extract_and_update_profile(user_id: str, messages: list):
         logger.error("extract_and_update_profile failed: %s", e)
     finally:
         conn.close()
+
+
+@celery_app.task
+def run_correction_cleanup_task(
+    user_id: str,
+    conversation_id: str | None,
+    turn_id: str | None,
+    messages: list,
+):
+    """intent=correction 时由 chat 链路异步触发。
+    LLM 判别 + 三层软处理；失败不影响主链路。
+    """
+    from app.services.correction_engine import run_correction_cleanup
+
+    engine = _get_engine()
+    stats = run_correction_cleanup(
+        user_id=user_id,
+        conversation_id=conversation_id,
+        turn_id=turn_id,
+        messages=messages,
+        db_path=_get_db_path(),
+        engine=engine,
+    )
+    logger.info("[correction] task done user=%s stats=%s", user_id, stats)
+    return stats
 
 
 @celery_app.task

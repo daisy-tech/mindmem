@@ -1,6 +1,8 @@
 # MindMem 1.0 产品需求文档
 
-> 版本：1.1 | 日期：2026-05-24 | 状态：Released
+> 版本：1.2 | 日期：2026-06-06 | 状态：Released
+>
+> v1.2 增量：评测实验室（合成 + 真实聊天记录）、在线记忆纠错管线、Prompt 透明度增强、LLM 模型升级至 Qwen3.7。
 
 ---
 
@@ -431,11 +433,116 @@ MemoBot 的"人格"不只是语气包，而是记忆表达边界、主动关心�
 
 ---
 
-## 5. 已知限制（1.1）
+### 2.9 评测实验室
+
+**需求描述**  
+将 MemoBot 的"记忆是否好用"从感性体验转化为可量化的工程指标。评测实验室由两套互补的 pipeline 组成：**合成评测**（Smoke / Full）固化既定 case；**真实聊天评估**对线上历史会话做 L0/L1 体检。详见 [Real-Chat-Eval.md](./Real-Chat-Eval.md)。
+
+#### 2.9.1 合成评测（persona 灌库 + 固定 case）
+
+- 一键灌入 persona_a_zhang 假人记忆
+- Smoke（20 条）/ Full（50 条）两套 case，覆盖 9 大 intent
+- L0 结构自检：JSON 合法、字段齐全
+- L1 启发式：intent 准确率、必含/禁出现关键词、人格签名、禁用句式
+- 报告导出：JSON + 前端表格 + intent confusion matrix
+- 黄色标记：低置信度（0.50–0.74）case 即使 pass 也标黄提醒
+
+**验收**：Full 50 通过率 ≥ 75%；`correction` 精确率 100%。
+
+#### 2.9.2 真实聊天评估（线上聊天记录）
+
+**需求描述**  
+不是每条对话都让 LLM 评分，而是当用户对某次会话有体感问题时，**点击"评估"按钮**触发，省 token 且只评关注会话。
+
+**核心需求**
+- 评测实验室左侧增加 Tab：「线上聊天记录」
+- 列表展示用户所有会话（标题、轮数、最新时间）
+- 点击单条 → 右侧渲染评估报告（不点击不消耗 token）
+- 每条 assistant 消息携带 `prompt_meta.snapshot_stats`（**当时**的记忆快照），评估时复用，无需重放
+- 评估输出：每轮的 L0 结构 + L1 规则命中 + 归因建议
+- 报告可下载为 `{conv_id}_{ts}_eval_review.json`
+
+**L1 规则覆盖（10 条以上，逐步扩展）**
+1. **`reply_off_topic`** — 回复与用户问题主题脱节
+2. **`recall_for_challenge`** — 用户质问记忆时 AI 是否真的引用了池里的实体
+3. **`data_vs_activation_gap`** — 数据库有但本轮未激活的相关记忆
+4. **`fabrication_under_challenge`** — 用户质问时 AI 编造池外实体
+5. **`correction_persisted`** — 上一轮被纠正的实体是否仍在本轮记忆池里
+6. **`correction_no_concrete_ack`** — AI 在纠错场景没有给出第一人称承认 + 复述用户事实
+7. **`forbidden_phrases_in_reply`** — 客服腔/卖萌/鸡汤等禁用句式
+8. **`sensitive_unsolicited`** — 敏感记忆未被询问就主动提
+9. **`relationship_subject_inferred`** — 代词消解错误
+10. **`followup_overflow`** — 单轮 follow-up 事件超过 1 条
+
+**验收**
+- 用户可在 30 秒内对任意历史会话拿到 L0 + L1 报告
+- 评估只读，不写库，不触发 Celery
+- 报告可作为后续 case fixture 灌回合成评测集
+
+---
+
+### 2.10 在线记忆纠错（Correction Pipeline）
+
+**需求描述**  
+当用户在对话中说"你记错了，X 不是 Y"时，AI 必须：(a) 立刻在回复里承认 + 复述用户的正确事实；(b) 后台自动清理对应的旧记忆和被否定的实体词，避免下次再犯。详见 [Correction-Pipeline.md](./Correction-Pipeline.md)。
+
+**核心需求**
+
+| 维度 | 行为 |
+|---|---|
+| 即时回复 | 第一人称承认（"我记错了 / 我搞混了"）+ 复述用户正确事实 + 不再提及被纠正的实体名词 |
+| 即时副作用 | `correction` intent 期间 **不**对本轮 assistant 回复跑 `extract_*` 任务（避免再学错） |
+| 后台清理 | Celery 异步触发 `run_correction_cleanup_task`，三层联动修正 |
+| 三层修正 | **episodic**：在 Mem0 软删除；**event**：标记 superseded；**profile**：写入 `interaction_history.user_corrections` |
+| 实体硬封禁 | 被用户否定的实体词（如"小鹏不是动物"）写入 `memory_deprecations(source='entity')`，下次提取/激活时硬过滤 |
+| 透明度 | Prompt 抽屉展示本轮过滤了多少 deprecated/banned 条目 |
+
+**LLM 判断（小模型）**
+
+- 候选检索：拼接 user + assistant 文本，按多 token 在 Mem0 检索 + 在 events/profile 中筛
+- 判断器返回 `{actions:[{ref_id, action, new_text, confidence}], banned_entities:[...]}`
+- `action` 取值：`keep / deprecate / update / audit_only`
+- 仅 `confidence ≥ 阈值` 的动作才落库
+
+**用户体感**
+- 用户**不需要**被告知"系统已更新记忆"等技术细节
+- 用户**应该**听到 AI 用人话承认 + 复述正确事实
+- 第二次问相同问题时，AI **不能**再用被纠正的实体
+
+**验收**
+- 在 P0 selftest 中加 `test_correction_engine_pure`（68 个用例，全过）
+- 真实聊天评估的 `correction_persisted` / `correction_no_concrete_ack` 规则可命中
+
+---
+
+### 2.11 Prompt 透明度增强
+
+**需求描述**  
+PromptDrawer 不只看"系统 prompt 字符串"，还要看路由决策链和召回过滤明细。
+
+**核心需求**
+
+| 字段 | 来源 | 用途 |
+|---|---|---|
+| `route.intent` + `confidence` + `intent_source` | Layer 2 分类器 | 验证意图判得对不对 |
+| `route.low_confidence` | classifier | 黄标记：低置信度提醒 |
+| `route.reasons` | hard_rule / classifier | "为什么是这个 intent" |
+| `activated[]` | composer | 本轮真正注入的每一条记忆 + 来源 + usage |
+| `context_layers` | context | 每层（profile/relationships/events/episodic/background）的完整候选 |
+| `snapshot_stats` | context | 召回统计：池内多少条、过滤了多少 deprecated、多少 banned、过滤后还剩多少 |
+
+**验收**
+- 真实聊天评估直接复用 `snapshot_stats`，无需重放
+- 每条 assistant 消息体内带 `<!--prompt_meta:...-->` 标记，导出审计 JSON 时可拆回
+
+---
+
+## 5. 已知限制（1.2）
 
 - 不支持多用户社交/分享
 - 不支持语音输入
 - 记忆衰减为定时批量处理（非实时）
 - 关系图只支持二层展示（用户 → 关系人）
-- 暂无记忆主动遗忘（forget）命令
-- 当前记忆使用策略仍以直接注入为主，尚未实现独立的记忆路由器/排序器
+- 纠错管线对 **事件层**的"软删除"为状态字段，尚未做单独 Tombstone 表
+- 真实聊天评估的 L1 规则仍以启发式为主，未引入 LLM Judge 做语义判分（v1.3 规划）
+- Prompt Composer 在极端长记忆（>10 条 explicit）下仍可能超 token 软上限，依赖 `max_explicit_memories` 截断

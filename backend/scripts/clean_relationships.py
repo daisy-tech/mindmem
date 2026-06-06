@@ -108,6 +108,7 @@ def llm_clean(rel_dict: dict, user_msgs: list[str], model: str) -> dict:
             {"role": "user", "content": payload},
         ],
         temperature=0,
+        extra_body={"enable_thinking": False},
     )
     raw = (resp.choices[0].message.content or "").strip()
     if raw.startswith("```"):
