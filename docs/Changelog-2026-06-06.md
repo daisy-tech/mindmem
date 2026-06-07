@@ -226,7 +226,111 @@ backend/scripts/selftest_p0.py
 
 ---
 
-## 11. 后续规划（v1.3 预告）
+## 11. v1.2.1 增量 — 人格契约可执行化（2026-06-07）
+
+### 11.1 背景
+
+回放 6/7 三份真实聊天（内向/中性/外向）后用户反馈"三种性格区分度不明显"，且发现 prompt 里并没有可执行的差异。
+
+### 11.2 根因
+
+| 问题 | 现象 |
+|---|---|
+| `PERSONALITY_TONE` 太宽 | 仅"短/平/多"三类描述，模型无法转化为可执行规则 |
+| `sensitive_mode` 注入屏蔽 | `memory_challenge` / `emotional_support` / `correction` 全部走 `sensitive_mode=True`，性格契约被完全跳过，结果三种人格在敏感场景输出几乎一样 |
+| `INTENT_GUIDES["casual"]` 与契约冲突 | guide 允许"反问一句开放问题"，与内向契约"不主动反问"矛盾，LLM 优先按 guide 执行 |
+| `_PERSONALITY_SKIP_INTENTS` 过宽 | eval 也跳过敏感 intent，掩盖了 AI 行为同质化 |
+
+### 11.3 修复
+
+1. **`PERSONALITY_CONTRACT` 重写**（`prompt_composer.py`）：每段含 4 个子分支
+   - 普通话题 / 质问记忆时 / 纠错时 / 情绪场景
+   - 三段长度差异：内向 ≤30 字、中性 ≤60 字、外向 ≤90 字
+   - 内向"不主动反问"、中性"最多 1 开放反问"、外向"1 反问 + 1 具体建议"
+2. **`PERSONALITY_CONTRACT_INTENTS` 扩充**：加入 `memory_challenge` / `emotional_support` / `correction`
+3. **去 `sensitive_mode` 注入条件**：除 `knowledge_task` 外全部注入
+4. **`INTENT_GUIDES["casual"]` 修复冲突**：删除"可反问一句开放问题"，改为"反问数量与是否引用记忆由本轮人格契约决定"
+5. **`eval_chat_review._PERSONALITY_SKIP_INTENTS` 收窄**：仅保留 `knowledge_task`
+6. **`_rule_personality_signature` 调整**：内向"主动引用记忆"豁免列表加上 `memory_challenge` / `correction`（这些 intent 本就要求引用）
+
+### 11.4 回放验证（6/7 三份对话）
+
+| 文件 | 人格 | 共轮 | final_status | personality_signature |
+|---|---|---:|---|---|
+| 内向型 | introvert | 15 | bad:14, suspicious:1 | **fail:14**, skip:1 |
+| 中性型 | balanced | 11 | ok:5, bad:3, suspicious:3 | **pass:8**, skip:3 |
+| 外向型 | extrovert | 21 | ok:9, bad:8, suspicious:4 | **pass:16**, skip:4, fail:1 |
+
+**结论**：
+- 评估系统现在能精准识别"人格不一致"——内向型 14/15 fail 与用户直观感受完全吻合（AI 在反问 + 主动引用 3~9 条旧记忆，典型外向行为）。
+- 外向型唯一 fail 是 "我能想到的是 X" 泛泛模板，恰好被新契约禁用，规则准确命中。
+- 中性/外向 pass 率高，说明 LLM 在这两种契约下行为基本符合预期。
+
+### 11.5 v1.2.2 hotfix — 移除 BASE_PERSONA 与契约重复 / 矛盾
+
+用户检查 v1.2.1 prompt 后指出 BASE_PERSONA 里几条与人格契约存在重复或冲突。
+
+| 旧条目 | 与契约冲突点 |
+|---|---|
+| BASE「单句≤30字；一般 1-3 句；情绪场景可只一句」 | "单句"vs"总长"语义混淆；"1-3 句"与外向"2-4 句"直接冲突 |
+| BASE「不主动复述记忆里/用户已说过的事实」 | 与中性/外向"可引用 1 条具体旧记忆"语义打架 |
+| `PERSONALITY_TONE` 字典 + 「人格：{persona_tone}」一行 | 残留旧描述式人格，与契约段重复 |
+| HARD_RULES「敏感场景下人格"主动性"被覆盖，不主动翻旧账、不复述背景」 | v1.2.1 已让敏感场景注入契约，契约里"质问记忆时"明确允许"挑 1 个具体候选"，与本条直接打架 |
+
+**修复**（`prompt_composer.py`）：
+1. BASE_PERSONA 删除字数/句数条 + 改"不主动复述记忆"为"不机械复述用户刚说过的话"
+2. BASE_PERSONA 新增一行：「回复字数、句数、是否反问、是否引用旧记忆 —— 全部由本轮人格契约决定」明确分工
+3. 整段删除 `PERSONALITY_TONE` 字典
+4. 删除 `compose()` 里 `persona_tone` 读取和"【本轮】人格：{persona_tone}"渲染行
+5. HARD_RULES 末行改为「敏感场景（情绪/纠错/质问）：执行本轮人格契约里对应子分支」，把权威指引交回契约段，消除冲突
+
+selftest 102/102 仍通过。TDD §6.4 样例同步更新。
+
+### 11.6 后续
+
+内向型大面积 fail 是**模型实际行为**问题（不是契约设计问题）。下一步可选：
+- 在 chat.py 后置做"长度截断"硬约束（违反契约时截掉超出部分）
+- 把契约前置到 `BASE_PERSONA` 上方，提升 LLM 注意权重
+- 收集若干 fail case 做 few-shot 注入
+
+### 11.7 v1.2.3 增量 — 评估结果服务端落盘 + 列表持久化展现
+
+**背景**：用户反馈两点：
+1. 评估实验室的下载文件落到 mac 本地，每次都要再 scp 到 ECS 才能让我（Cursor）分析
+2. 已评估过的对话每次都要再点「评估」才能看到结果
+
+**改动**：
+- 新增 `backend/app/services/eval_chat_store.py`：覆盖式落盘到 `backend/eval/exports/reviews/{user_id}/{conv_id}.json`（NFS 共享后 mac/ECS/容器同一份文件）
+- `GET /api/eval/chat-audit/{conv_id}` 加 `force` 参数；默认命中磁盘直接返回，force=true 才重跑覆盖
+- 新增 `GET /api/eval/chat-audit-stored`（列表）和 `DELETE /api/eval/chat-audit-stored/{conv_id}`
+- 前端 `stores/evalChat.ts`：
+  - 加 `storedMeta` 状态，进入页面顺带拉
+  - `select(convId)` 自动 silent 加载已落盘 review（无 loading 旋钮）
+  - 加 `deleteStored()`
+- `EvalChatPanel.vue`：
+  - 列表项加左侧绿色侧栏 + ✓标 + 三色 mini-bar（ok/suspicious/bad 按比例切分）
+  - 工具栏按钮根据 stored 状态切换：未存→「开始评估」/已存→「重新评估」+「清除已存」
+  - 选中已评估的对话直接显示报告，无需用户再点
+- `docker-compose.yml` 加 `EVAL_CHAT_REVIEWS_DIR=/app/eval/exports/reviews`
+- `.gitignore` 加 `backend/eval/exports/`（含真实对话内容，不入仓）
+- selftest 加 9 条 `test_eval_chat_store`（落盘/读盘/列表/删除/路径穿越防御）
+
+selftest: **111/111 通过**
+
+### 11.8 测试
+
+```
+backend/scripts/selftest_p0.py
+合计: 111/111 通过 ✅
+```
+
+新增/调整：
+- `test_prompt_composer`：emotional_support / memory_challenge 注入契约的断言；knowledge_task 不注入的断言
+- `test_personality_signature_rule`：内向 memory_challenge / self_summary 引用应 pass；内向 emotional_support 短回应 pass、反问 fail；balanced correction 承认 pass；knowledge_task skip
+
+---
+
+## 12. 后续规划（v1.3 预告）
 
 - L1 启发式 → 引入 LLM Judge（仅对启发式标红的 turn 调，控成本）
 - 评测实验室加跨会话 trend / 用户级评分卡

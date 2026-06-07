@@ -470,6 +470,117 @@ def _rule_fabrication_under_challenge(
     )
 
 
+# ============ 人格签名一致性规则 ============
+
+# 每个人格的硬指标。修改这里要同步 prompt_composer.PERSONALITY_CONTRACT。
+# - max_reply_chars：回复总长上限（按中文字符计，超出即 fail）
+# - max_questions：reply 里反问句数量上限（"？""?"统计）
+# - max_explicit_memories：单轮允许"显性引用"的旧记忆条数
+# - allow_proactive_memory：是否允许用户没问就主动引用旧记忆
+_PERSONALITY_SIGNATURE = {
+    "introvert": {
+        "max_reply_chars": 36,        # 30 字硬约束 + 20% buffer 容标点
+        "max_questions": 0,
+        "max_explicit_memories": 1,
+        "allow_proactive_memory": False,
+    },
+    "balanced": {
+        "max_reply_chars": 72,        # 60 字 + 20%
+        "max_questions": 1,
+        "max_explicit_memories": 2,
+        "allow_proactive_memory": True,
+    },
+    "extrovert": {
+        "max_reply_chars": 108,       # 90 字 + 20%
+        "max_questions": 1,
+        "max_explicit_memories": 3,
+        "allow_proactive_memory": True,
+    },
+}
+
+# 仅 knowledge_task 与人格无关，跳过；其余包括敏感场景都按契约检查
+# （契约自含"敏感场景压抑版"子分支，能区分内向/中性/外向的不同表现）
+_PERSONALITY_SKIP_INTENTS = {
+    "knowledge_task",
+}
+
+
+def _count_questions(reply: str) -> int:
+    """数 reply 里"问句"数量：以？或?结尾的子句，并去掉显然反问助词（吗/呢）只一个的口语化情形。"""
+    if not reply:
+        return 0
+    return reply.count("？") + reply.count("?")
+
+
+def _count_chinese_chars(reply: str) -> int:
+    """按"可见汉字+字母+数字"统计长度，忽略空白和标点。"""
+    if not reply:
+        return 0
+    return sum(1 for c in reply if c.strip() and c not in "，。！？、；：…—~·,.!?;:\n\r\"'""''「」（）()【】[]<>《》")
+
+
+def _rule_personality_signature(reply: str | None, prompt_meta: dict) -> dict:
+    """G 层（性格契约）：reply 是否符合本轮 personality 的硬指标。
+    
+    指标：字数上限、反问数上限、显性引用条数上限、是否主动引用记忆。
+    任何一个硬指标越界即 fail。
+    """
+    route = prompt_meta.get("route") or {}
+    intent = route.get("intent") or ""
+    personality = route.get("personality") or "balanced"
+    sig = _PERSONALITY_SIGNATURE.get(personality)
+    if not sig:
+        return _rule("personality_signature", "skip", "medium",
+                     f"未知人格 {personality}")
+    if intent in _PERSONALITY_SKIP_INTENTS:
+        return _rule("personality_signature", "skip", "medium",
+                     f"intent={intent}（敏感场景人格主动性被覆盖）")
+    if not reply:
+        return _rule("personality_signature", "skip", "medium", "无回复")
+
+    violations: list[str] = []
+
+    chars = _count_chinese_chars(reply)
+    if chars > sig["max_reply_chars"]:
+        violations.append(f"字数 {chars}>{sig['max_reply_chars']}")
+
+    qcount = _count_questions(reply)
+    if qcount > sig["max_questions"]:
+        violations.append(f"反问 {qcount}>{sig['max_questions']}")
+
+    activated = prompt_meta.get("activated") or []
+    explicit_count = sum(1 for it in activated if it.get("usage") == "explicit_ok")
+    if explicit_count > sig["max_explicit_memories"]:
+        violations.append(
+            f"explicit {explicit_count}>{sig['max_explicit_memories']}"
+        )
+
+    # 主动引用判断（仅对禁主动引用的人格，如内向型）
+    # 这些 intent 本身就允许/要求引用记忆，不算"主动"：
+    if not sig["allow_proactive_memory"]:
+        _MEM_ALLOWED_INTENTS = {
+            "self_summary",        # 用户要求"总结你对我的了解"
+            "relationship_topic",  # 用户在谈某个人，必须引用关系
+            "memory_challenge",    # 用户在质问记忆，必须复述
+            "correction",          # 纠错必须复述用户给的事实
+        }
+        if activated and intent not in _MEM_ALLOWED_INTENTS:
+            violations.append(
+                f"内向型主动引用 {len(activated)} 条旧记忆（intent={intent}）"
+            )
+
+    if violations:
+        return _rule(
+            "personality_signature", "fail", "medium",
+            f"{personality}：" + "；".join(violations),
+            attribution=["D"],
+        )
+    return _rule(
+        "personality_signature", "pass", "medium",
+        f"{personality} 契约通过（{chars}字/{qcount}问/{explicit_count}显性）",
+    )
+
+
 # ============ 评估单轮 ============
 
 
@@ -497,12 +608,22 @@ def _l1_status_aggregate(rules: list[dict]) -> str:
 
 
 def _final_status(l0: str, l1: str) -> str:
-    """整轮一句话结论。"""
+    """整轮一句话结论。
+    
+    评分原则（v1.2 后调整）：
+    - L0 fail（high 失败）或 L1 bad → bad
+    - L1 suspicious → suspicious（无论 L0）
+    - L0 pass + L1 pass/ok → good
+    - L0 warn（仅 medium 失败）+ L1 pass/ok/skip → ok（不再因 medium 假阳性掉到 suspicious）
+    - 其它 → skip
+    """
     if l0 == "fail" or l1 == "bad":
         return "bad"
-    if l0 == "warn" or l1 == "suspicious":
+    if l1 == "suspicious":
         return "suspicious"
     if l0 == "pass" and l1 in {"ok", "skip"}:
+        return "good"
+    if l0 in {"pass", "warn"} and l1 in {"ok", "skip"}:
         return "ok"
     return "skip"
 
@@ -555,6 +676,7 @@ def review_turn(turn: dict, prev_turn: dict | None = None) -> dict:
         _rule_correction_persisted(prev_turn, prompt_meta),
         _rule_correction_no_concrete_ack(user_msg, reply, intent),
         _rule_fabrication_under_challenge(reply, prompt_meta),
+        _rule_personality_signature(reply, prompt_meta),
     ]
 
     l0 = _l0_status_from_checks(checks)

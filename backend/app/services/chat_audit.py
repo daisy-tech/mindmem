@@ -49,12 +49,20 @@ BOUNDARY_PATTERNS = [
 ]
 
 # system prompt 分区标题（与 prompt_composer 对齐）
+# v1.2 prompt 瘦身后的新段标题；保留旧标题作为兼容（处理瘦身前导出的老 audit 包）
 _SECTION_HEADERS = {
+    "stable_bg": "【你已知关于用户的事】",
+    "explicit": "【本轮可以提及的具体记忆】",
+    "followup": "【可轻问一次的近期事件】",
+    "background": "【你大致还记得这些（默认不主动说出）】",
+    "usage": "【本轮】",
+    "hard": "≪硬边界",
+}
+_SECTION_HEADERS_LEGACY = {
     "stable_bg": "【稳定背景】",
     "explicit": "【当前可显性引用的记忆】",
     "followup": "【可轻跟进的事件】",
     "background": "【背景信息（默认不主动说出）】",
-    "rules": "【背景信息使用规则",  # 用作终止标记之一
     "usage": "【本轮使用规则】",
     "hard": "硬边界",
 }
@@ -94,20 +102,17 @@ def _mem_ref(mem: dict) -> str:
 
 
 def _parse_system_sections(system_text: str | None) -> dict[str, str]:
-    """按【...】标题切 system prompt，方便核对某条记忆是否在期望分区里。"""
+    """按【...】标题切 system prompt，兼容 v1.2 新标题与瘦身前的旧标题。"""
     if not system_text:
         return {}
     sections: dict[str, str] = {}
-    order = [
-        ("stable_bg", _SECTION_HEADERS["stable_bg"]),
-        ("explicit", _SECTION_HEADERS["explicit"]),
-        ("followup", _SECTION_HEADERS["followup"]),
-        ("background", _SECTION_HEADERS["background"]),
-        ("usage", _SECTION_HEADERS["usage"]),
-    ]
+    keys = ("stable_bg", "explicit", "followup", "background", "usage")
     positions: list[tuple[str, int]] = []
-    for key, header in order:
-        idx = system_text.find(header)
+    for key in keys:
+        # 先找新标题；找不到再 fallback 旧标题
+        idx = system_text.find(_SECTION_HEADERS[key])
+        if idx < 0:
+            idx = system_text.find(_SECTION_HEADERS_LEGACY[key])
         if idx >= 0:
             positions.append((key, idx))
     positions.sort(key=lambda x: x[1])

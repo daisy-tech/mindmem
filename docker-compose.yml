@@ -28,6 +28,9 @@ services:
       - INTENT_CLASSIFIER_ENABLED=true
       - PROMPT_TIMEZONE=Asia/Shanghai
       - EVAL_PASS_THRESHOLD=0.85
+      # 线上聊天评估结果落盘目录（容器内）。bind mount ./backend:/app 后，
+      # host 上对应 backend/eval/exports/reviews，再经 NFS 给 mac 同步可见。
+      - EVAL_CHAT_REVIEWS_DIR=/app/eval/exports/reviews
       - TZ=Asia/Shanghai
     volumes:
       - ./backend:/app

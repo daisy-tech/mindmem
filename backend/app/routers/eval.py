@@ -290,10 +290,13 @@ async def eval_delete_draft(
 # 用户点「开始评估」时调用；只读 SQLite（含 mem0 metadata），不调 LLM。
 # - 默认 include_legacy_snapshot=false：用当时 prompt_meta 自带的池子做对照
 # - 想看「评估时刻全库」做近似时再传 true
+# - 默认 force=false：若磁盘已存评估结果（backend/eval/exports/reviews/...）
+#   直接读盘返回，秒级；force=true 时才重评估并覆盖落盘
 @router.get("/chat-audit/{conversation_id}")
 async def eval_chat_audit(
     conversation_id: str,
     include_legacy_snapshot: bool = False,
+    force: bool = False,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -302,6 +305,14 @@ async def eval_chat_audit(
     from app.models.conversation import Conversation
     from app.services.chat_audit import build_audit_pack
     from app.services.eval_chat_review import review_audit_pack
+    from app.services import eval_chat_store
+
+    # 命中已落盘评估：直接返回，UI 端可秒展示
+    if not force:
+        cached = eval_chat_store.load_review(user.id, conversation_id)
+        if cached is not None:
+            cached["__from_store"] = True
+            return cached
 
     result = await db.execute(
         select(Conversation).where(
@@ -319,4 +330,35 @@ async def eval_chat_audit(
         db=db,
     )
     pack = review_audit_pack(pack)
+    try:
+        eval_chat_store.save_review(user.id, conversation_id, pack)
+        pack["__from_store"] = False
+    except Exception as e:  # 持久化失败不阻塞前端返回结果
+        logger.exception("save eval review to disk failed: %s", e)
+        pack["__from_store"] = False
+        pack["__store_error"] = str(e)
     return pack
+
+
+@router.get("/chat-audit-stored")
+async def eval_chat_audit_stored_list(
+    user: User = Depends(get_current_user),
+):
+    """列出当前用户所有已落盘的评估摘要（用于左侧列表标"已评估✓"等徽章）。"""
+    from app.services import eval_chat_store
+
+    return {"items": eval_chat_store.list_stored(user.id)}
+
+
+@router.delete("/chat-audit-stored/{conversation_id}")
+async def eval_chat_audit_stored_delete(
+    conversation_id: str,
+    user: User = Depends(get_current_user),
+):
+    """删除某个会话的已落盘评估，下次进入将重新触发评估。"""
+    from app.services import eval_chat_store
+
+    deleted = eval_chat_store.delete_review(user.id, conversation_id)
+    if not deleted:
+        raise HTTPException(404, "未找到已落盘的评估结果")
+    return {"ok": True}

@@ -42,3 +42,5 @@ backend/celerybeat-schedule
 *_smoke_report.json
 conv_*_chat_audit.json
 conv_*_eval_review.json
+# 线上聊天评估服务端落盘目录（每用户独立子目录，含真实对话）
+backend/eval/exports/

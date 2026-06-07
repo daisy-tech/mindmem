@@ -23,20 +23,23 @@
         v-for="c in conversations"
         :key="c.id"
         class="conv-item"
-        :class="{ active: c.id === selectedId }"
+        :class="{ active: c.id === selectedId, evaluated: storedMeta.has(c.id) }"
         @click="onSelect(c.id)"
       >
-        <div class="conv-title">{{ c.title || '（未命名）' }}</div>
+        <div class="conv-title-row">
+          <div class="conv-title">{{ c.title || '（未命名）' }}</div>
+          <el-tooltip
+            v-if="storedMeta.has(c.id)"
+            :content="`已评估 · ${formatTime(storedMeta.get(c.id)?.evaluated_at)}`"
+            placement="top"
+          >
+            <span class="evaluated-mark">✓</span>
+          </el-tooltip>
+        </div>
         <div class="conv-meta">
           <span>{{ formatTime(c.updated_at) }}</span>
-          <el-tag
-            v-if="cacheBadge(c.id)"
-            :type="cacheBadge(c.id)!.type"
-            size="small"
-            effect="plain"
-          >
-            {{ cacheBadge(c.id)!.text }}
-          </el-tag>
+          <!-- 三色 mini-bar：固定 60px 宽，按 final_ok/suspicious/bad 比例切分 -->
+          <ScoreBar v-if="storedMeta.has(c.id)" :meta="storedMeta.get(c.id)!" />
         </div>
       </div>
     </aside>
@@ -51,23 +54,40 @@
           <h3 class="report-title">
             {{ selectedConv?.title || selectedId }}
             <span class="muted">· {{ selectedConv?.updated_at ? formatTime(selectedConv.updated_at) : '' }}</span>
+            <span
+              v-if="currentReport && storedMeta.get(selectedId!)?.evaluated_at"
+              class="muted small evaluated-hint"
+            >
+              · 已评估于 {{ formatTime(storedMeta.get(selectedId!)!.evaluated_at) }}
+            </span>
           </h3>
           <div class="toolbar-actions">
             <el-button
+              v-if="!currentReport"
               type="primary"
               :loading="evaluating"
               :disabled="evaluating"
               @click="onEvaluate(false)"
             >
-              {{ currentReport ? '重新评估' : '开始评估' }}
+              开始评估
+            </el-button>
+            <el-button
+              v-else
+              :loading="evaluating"
+              :disabled="evaluating"
+              @click="onEvaluate(true)"
+              title="服务端重跑并覆盖落盘文件"
+            >
+              重新评估
             </el-button>
             <el-button
               v-if="currentReport"
-              :loading="evaluating"
-              @click="onEvaluate(true)"
-              title="强制重新拉取，绕过本地缓存"
+              type="danger"
+              link
+              @click="onClearStored"
+              title="删除服务端落盘文件，下次进入会重新评估"
             >
-              强制刷新
+              清除已存
             </el-button>
             <el-button v-if="currentReport" @click="onDownload">
               下载评估 JSON
@@ -86,7 +106,7 @@
 
         <div v-if="!currentReport && !evaluating" class="empty-tip">
           <el-empty
-            description="点击「开始评估」拉取该会话的结构分析（不会调用 LLM，不耗 token）"
+            description="该会话尚未评估。点「开始评估」拉取分析（不调用 LLM，不耗 token）"
           />
         </div>
 
@@ -221,10 +241,10 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, h } from 'vue'
 import { storeToRefs } from 'pinia'
-import { ElMessage } from 'element-plus'
-import { useEvalChatStore, type AuditTurn } from '../stores/evalChat'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { useEvalChatStore, type AuditTurn, type StoredMeta } from '../stores/evalChat'
 import EvalChatTurnDrawer from './EvalChatTurnDrawer.vue'
 
 const store = useEvalChatStore()
@@ -236,6 +256,7 @@ const {
   evaluating,
   evalError,
   currentReport,
+  storedMeta,
 } = storeToRefs(store)
 
 const drawerVisible = ref(false)
@@ -253,8 +274,8 @@ async function refresh() {
   await store.fetchConversations(true)
 }
 
-function onSelect(id: string) {
-  store.select(id)
+async function onSelect(id: string) {
+  await store.select(id)  // 已落盘则自动加载，否则只切换 selectedId
 }
 
 async function onEvaluate(force: boolean) {
@@ -267,22 +288,28 @@ async function onEvaluate(force: boolean) {
   }
 }
 
+async function onClearStored() {
+  if (!selectedId.value) return
+  try {
+    await ElMessageBox.confirm(
+      '将删除服务端的评估文件，下次进入该会话会重新评估。继续？',
+      '确认清除已存评估',
+      { type: 'warning', confirmButtonText: '清除', cancelButtonText: '取消' },
+    )
+  } catch {
+    return  // 用户取消
+  }
+  try {
+    await store.deleteStored(selectedId.value)
+    ElMessage.success('已清除该会话的服务端评估文件')
+  } catch (e) {
+    ElMessage.error(`清除失败：${e instanceof Error ? e.message : String(e)}`)
+  }
+}
+
 function onDownload() {
   store.downloadCurrent()
   ElMessage.success('已开始下载评估 JSON')
-}
-
-function cacheBadge(id: string): { type: 'success' | 'warning' | 'danger' | 'info'; text: string } | null {
-  const pack = (store.currentReport && store.selectedId === id)
-    ? store.currentReport
-    : null
-  // 暂只标"当前选中已评过"——避免遍历缓存影响渲染
-  if (!pack || pack.conversation.id !== id) return null
-  const c = pack.review?.counters
-  if (!c) return null
-  if (c.final_bad > 0) return { type: 'danger', text: `❌${c.final_bad}` }
-  if (c.final_suspicious > 0) return { type: 'warning', text: `🟡${c.final_suspicious}` }
-  return { type: 'success', text: '✓' }
 }
 
 function formatTime(iso?: string | null) {
@@ -292,6 +319,39 @@ function formatTime(iso?: string | null) {
   } catch {
     return iso
   }
+}
+
+// 三色 mini-bar：内联组件，避免新建文件
+const ScoreBar = {
+  props: { meta: { type: Object as () => StoredMeta, required: true } },
+  setup(props: { meta: StoredMeta }) {
+    return () => {
+      const c = props.meta.counters
+      const total = c.final_ok + c.final_suspicious + c.final_bad
+      if (total === 0) {
+        return h('span', { class: 'score-bar empty', title: '无可评估轮次' }, '—')
+      }
+      const pct = (n: number) => `${((n / total) * 100).toFixed(0)}%`
+      return h(
+        'span',
+        {
+          class: 'score-bar',
+          title: `ok ${c.final_ok} / 可疑 ${c.final_suspicious} / 失败 ${c.final_bad}`,
+        },
+        [
+          c.final_ok > 0
+            ? h('i', { class: 'seg ok', style: { width: pct(c.final_ok) } })
+            : null,
+          c.final_suspicious > 0
+            ? h('i', { class: 'seg sus', style: { width: pct(c.final_suspicious) } })
+            : null,
+          c.final_bad > 0
+            ? h('i', { class: 'seg bad', style: { width: pct(c.final_bad) } })
+            : null,
+        ],
+      )
+    }
+  },
 }
 
 function getIntent(turn: AuditTurn): string | undefined {
@@ -374,6 +434,7 @@ function openTurn(row: AuditTurn) {
   cursor: pointer;
   margin-bottom: 4px;
   transition: background 0.15s;
+  position: relative;
 }
 .conv-item:hover {
   background: #ecf5ff;
@@ -382,6 +443,17 @@ function openTurn(row: AuditTurn) {
   background: #e1eafd;
   outline: 1px solid #b3d4ff;
 }
+.conv-item.evaluated {
+  border-left: 3px solid #67c23a;
+  padding-left: 9px;
+}
+
+.conv-title-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
 
 .conv-title {
   font-size: 14px;
@@ -389,6 +461,15 @@ function openTurn(row: AuditTurn) {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  flex: 1;
+  min-width: 0;
+}
+
+.evaluated-mark {
+  color: #67c23a;
+  font-weight: bold;
+  font-size: 12px;
+  flex-shrink: 0;
 }
 
 .conv-meta {
@@ -398,6 +479,34 @@ function openTurn(row: AuditTurn) {
   margin-top: 4px;
   font-size: 12px;
   color: #909399;
+}
+
+/* 三色 mini-bar：ok 绿 / suspicious 黄 / bad 红 */
+.score-bar {
+  display: inline-flex;
+  width: 64px;
+  height: 6px;
+  border-radius: 3px;
+  background: #ebeef5;
+  overflow: hidden;
+}
+.score-bar.empty {
+  background: transparent;
+  color: #c0c4cc;
+  font-size: 11px;
+  width: auto;
+  height: auto;
+}
+.score-bar .seg {
+  display: block;
+  height: 100%;
+}
+.score-bar .seg.ok { background: #67c23a; }
+.score-bar .seg.sus { background: #e6a23c; }
+.score-bar .seg.bad { background: #f56c6c; }
+
+.evaluated-hint {
+  margin-left: 4px;
 }
 
 .report-main {

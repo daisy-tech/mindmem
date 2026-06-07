@@ -235,14 +235,38 @@ GET /api/eval/chat-review/{conv_id}
 → 返回上次跑过的 review（若有缓存）
 ```
 
-### 8.3 触发与缓存策略
+### 8.3 触发与缓存策略（v1.2.2 起：服务端落盘）
+
+```
+GET    /api/eval/chat-audit/{conv_id}?force=false   # 默认：磁盘有则秒返回
+GET    /api/eval/chat-audit/{conv_id}?force=true    # 强制重评估并覆盖
+GET    /api/eval/chat-audit-stored                  # 列出已落盘的所有摘要
+DELETE /api/eval/chat-audit-stored/{conv_id}        # 删除已落盘
+```
+
+落盘路径（容器内）：
+
+```
+/app/eval/exports/reviews/{user_id}/{conv_id}.json
+```
+
+通过 `./backend:/app` bind mount，对应 host 上 `backend/eval/exports/reviews/`；
+再经 NFS 共享，mac/ECS/容器看到同一份文件，**不再需要"浏览器下载 + scp 上传"**。
 
 | 场景 | 行为 |
 |---|---|
-| 用户首次点「评估」 | POST 跑 review，结果缓存到内存 / 临时文件 |
-| 用户再次点同一会话 | 优先 GET 返回缓存 |
-| 用户在该会话又聊了新轮次 | 缓存失效，下次 POST 重跑 |
-| 用户在 EvalView 切换会话 | 不自动跑，必须用户点按钮 |
+| 用户首次进入评估实验室 | `fetchConversations()` 顺带拉 `chat-audit-stored`，给会话列表打✓标 |
+| 选中已评估的会话 | 自动 `evaluate(force=false)`，服务端直接读盘返回，秒展示 |
+| 选中未评估的会话 | 仅切换 selectedId，等待用户点「开始评估」 |
+| 用户点「重新评估」 | `force=true`，服务端重跑并覆盖落盘 |
+| 用户点「清除已存」 | `DELETE`，从磁盘移除该会话评估文件 |
+| 用户在该会话又聊了新轮次 | 旧评估文件仍在；用户主动点「重新评估」才更新 |
+
+环境变量：
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `EVAL_CHAT_REVIEWS_DIR` | `/app/eval/exports/reviews` | 容器内落盘根目录；按 `{user_id}/{conv_id}.json` 组织 |
 
 ---
 

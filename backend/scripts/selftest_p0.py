@@ -92,7 +92,7 @@ from app.services.memory_context import (  # noqa: E402
 )
 from app.services.memory_router import MemoryRoute, MemoryUsage  # noqa: E402
 from app.services.prompt_composer import compose  # noqa: E402
-from app.services.personality import MemoryPersonality  # noqa: E402
+from app.services.personality import MemoryPersonality, PERSONALITY_CONFIG  # noqa: E402
 
 
 REL_KEYS = ["妻子", "儿子", "小孙孙", "小魏魏", "邻居老爷爷"]
@@ -272,6 +272,212 @@ def test_prompt_composer() -> tuple[int, int]:
     total += 1
     if check("memory_challenge 含质问记忆指引", "【质问记忆指引】" in prompt2):
         ok += 1
+
+    # ---------- 性格契约块差异测试（v1.2.x 新增）----------
+    # casual intent + 三种性格，应该分别拼入不同的人格契约块
+    def _casual_prompt(personality: MemoryPersonality) -> str:
+        r = MemoryRoute(
+            intent="casual",
+            memory_depth="minimal",
+            load_layers=["profile_basic"],
+            query="你好",
+            sensitive_mode=False,
+            max_explicit_memories=PERSONALITY_CONFIG[personality.value]["max_explicit_memories"],
+            event_policy="none",
+            personality=personality,
+        )
+        c = MemoryContext(route=r)
+        c.stable_profile = [
+            RoutedMemory(source="profile", text="姓名: dxj", usage=MemoryUsage.BACKGROUND_ONLY, reason="", score=0.9),
+        ]
+        c.relevant_relationships = []
+        c.relevant_events = []
+        c.relevant_memories = []
+        c.background_only = []
+        p, _ = compose(c)
+        return p
+
+    p_in = _casual_prompt(MemoryPersonality.INTROVERT)
+    p_ba = _casual_prompt(MemoryPersonality.BALANCED)
+    p_ex = _casual_prompt(MemoryPersonality.EXTROVERT)
+
+    contract_checks = [
+        ("内向契约块出现", "≪本轮人格契约·内向型≫" in p_in),
+        ("中性契约块出现", "≪本轮人格契约·中性型≫" in p_ba),
+        ("外向契约块出现", "≪本轮人格契约·外向型≫" in p_ex),
+        ("内向不出现中性契约", "≪本轮人格契约·中性型≫" not in p_in),
+        ("中性不出现外向契约", "≪本轮人格契约·外向型≫" not in p_ba),
+        ("内向≤30字硬指标", "≤ 30 字" in p_in),
+        ("中性≤60字硬指标", "≤ 60 字" in p_ba),
+        ("外向≤90字硬指标", "≤ 90 字" in p_ex),
+        # 三份 prompt 实质不同（契约内容不同；不是只换一行 tone）
+        ("三份 prompt 内容互不相同", len({p_in, p_ba, p_ex}) == 3),
+        ("内向 prompt 含「≤ 30 字」硬指标", "≤ 30 字" in p_in),
+        ("内向 prompt 不含「≤ 90 字」", "≤ 90 字" not in p_in),
+        ("外向 prompt 含「≤ 90 字」硬指标", "≤ 90 字" in p_ex),
+        ("外向 prompt 不含「≤ 30 字」", "≤ 30 字" not in p_ex),
+    ]
+    for name, cond in contract_checks:
+        total += 1
+        if check(name, cond):
+            ok += 1
+
+    # v1.2.x：emotional_support / memory_challenge / correction 等敏感 intent 也注入契约
+    # （契约自含敏感场景子分支），以让性格在敏感场景仍能拉出差异
+    r_emo = MemoryRoute(
+        intent="emotional_support",
+        memory_depth="safe_focused",
+        load_layers=["profile_basic", "episodic"],
+        query="我很累",
+        sensitive_mode=True,
+        max_explicit_memories=1,
+        event_policy="background_pain_points",
+        personality=MemoryPersonality.EXTROVERT,
+    )
+    c_emo = MemoryContext(route=r_emo)
+    c_emo.stable_profile = []
+    c_emo.relevant_relationships = []
+    c_emo.relevant_events = []
+    c_emo.relevant_memories = []
+    c_emo.background_only = []
+    p_emo, _ = compose(c_emo)
+    total += 1
+    if check("emotional_support 注入外向契约", "≪本轮人格契约·外向型≫" in p_emo):
+        ok += 1
+    total += 1
+    if check("emotional_support 契约含「情绪场景」子分支", "情绪场景" in p_emo):
+        ok += 1
+
+    # memory_challenge 也应注入契约（用户提的痛点：外向型在质问记忆时也应该有差异）
+    r_mc = MemoryRoute(
+        intent="memory_challenge",
+        memory_depth="focused",
+        load_layers=["profile", "relationships", "events", "episodic"],
+        query="你记得我喜欢什么茶吗",
+        sensitive_mode=True,
+        max_explicit_memories=3,
+        event_policy="summary",
+        personality=MemoryPersonality.EXTROVERT,
+    )
+    c_mc = MemoryContext(route=r_mc)
+    c_mc.stable_profile = []
+    c_mc.relevant_relationships = []
+    c_mc.relevant_events = []
+    c_mc.relevant_memories = []
+    c_mc.background_only = []
+    p_mc, _ = compose(c_mc)
+    total += 1
+    if check("memory_challenge 注入外向契约（用户痛点回归）",
+             "≪本轮人格契约·外向型≫" in p_mc):
+        ok += 1
+    total += 1
+    if check("memory_challenge 契约含「质问记忆时」子分支",
+             "质问记忆时" in p_mc):
+        ok += 1
+
+    # knowledge_task 仍不注入（与人格无关）
+    r_kt = MemoryRoute(
+        intent="knowledge_task",
+        memory_depth="minimal",
+        load_layers=["profile_basic"],
+        query="什么是 OKR",
+        sensitive_mode=False,
+        max_explicit_memories=0,
+        event_policy="none",
+        personality=MemoryPersonality.EXTROVERT,
+    )
+    c_kt = MemoryContext(route=r_kt)
+    c_kt.stable_profile = []
+    c_kt.relevant_relationships = []
+    c_kt.relevant_events = []
+    c_kt.relevant_memories = []
+    c_kt.background_only = []
+    p_kt, _ = compose(c_kt)
+    total += 1
+    if check("knowledge_task 不注入契约（与人格无关）",
+             "≪本轮人格契约" not in p_kt):
+        ok += 1
+
+    return ok, total
+
+
+def test_personality_signature_rule() -> tuple[int, int]:
+    """test eval_chat_review._rule_personality_signature 各种边界情形。"""
+    print("\n=== 6.5 L1 personality_signature 规则 ===")
+    from app.services.eval_chat_review import _rule_personality_signature
+
+    ok = 0
+    total = 0
+
+    def _meta(personality: str, intent: str = "casual", activated_n: int = 0) -> dict:
+        return {
+            "route": {"intent": intent, "personality": personality},
+            "activated": [
+                {"usage": "explicit_ok", "text": f"x{i}"} for i in range(activated_n)
+            ],
+        }
+
+    cases = [
+        # 内向：8 字 + 0 问 + 0 activated → pass
+        ("introvert casual 8字0问 → pass",
+         "今天天气不错。", _meta("introvert"), "pass"),
+        # 内向：>36 字 → fail
+        ("introvert 超字数 → fail",
+         "今天的天气真好阳光明亮心情也跟着轻盈起来不如出去走走应该是不错的选择慢慢散步即可", _meta("introvert"), "fail"),
+        # 内向：有反问 → fail
+        ("introvert 反问 → fail",
+         "天气不错呀。要不要出去走走？", _meta("introvert"), "fail"),
+        # 中性：50 字 + 1 问 → pass
+        ("balanced 50字1问 → pass",
+         "今天天气特别好，雨后清新，出门走走也不错。要不要找个公园散散步？", _meta("balanced"), "pass"),
+        # 中性：2 问 → fail
+        ("balanced 2问 → fail",
+         "天气好吗？要出门吗？", _meta("balanced"), "fail"),
+        # 外向：80 字 + 1 问 → pass
+        ("extrovert 80字1问 → pass",
+         "雨后晴，最适合出门。可以去温榆河公园转转，那边步道清净。你想带儿子一起吗？", _meta("extrovert"), "pass"),
+        # 外向：超 108 字 → fail
+        ("extrovert 超字数 → fail",
+         "天气不错出门走走最合适的去处是温榆河公园那里的湖边步道相当安静适合慢慢欣赏景色"
+         "还可以带上一套小茶具找个无人的角落静静泡一壶茶看景独处时光也算另一种享受方式"
+         "你想带儿子一起去公园玩玩还是更喜欢独自前往放松一下心情都是不错的", _meta("extrovert"), "fail"),
+        # v1.2.x：敏感场景现在也评估（契约自含敏感子分支）
+        # 内向 emotional_support：短 reply + 不反问 → pass
+        ("introvert emotional_support 短回应 → pass",
+         "翻来覆去的夜很难熬。", _meta("introvert", "emotional_support"), "pass"),
+        # 内向 emotional_support 反问 → fail（违反"情绪场景不反问"）
+        ("introvert emotional_support 反问 → fail",
+         "翻来覆去的夜很难熬。要说说吗？", _meta("introvert", "emotional_support"), "fail"),
+        # 中性 correction 承认+复述 → pass
+        ("balanced correction 短承认 → pass",
+         "我记错了，按你说的。", _meta("balanced", "correction"), "pass"),
+        # knowledge_task 跳过（与人格无关）
+        ("knowledge_task 跳过",
+         "OKR 是目标与关键结果管理框架。", _meta("introvert", "knowledge_task"), "skip"),
+        # 内向 + 主动引用 1 条记忆（intent=casual）→ fail
+        ("introvert 主动引用 1 条 → fail",
+         "嗯。", _meta("introvert", "casual", activated_n=1), "fail"),
+        # 内向 + memory_challenge 引用 1 条 → pass（质问记忆时被允许引用）
+        ("introvert memory_challenge 引用 → pass",
+         "我没记下来。", _meta("introvert", "memory_challenge", activated_n=1), "pass"),
+        # 内向 + self_summary 引用 → pass（用户主动要求总结）
+        ("introvert self_summary 引用 → pass",
+         "你住北京。", _meta("introvert", "self_summary", activated_n=1), "pass"),
+        # 中性 + 主动引用 2 条 → pass（在 max 内）
+        ("balanced 引用 2 条 → pass",
+         "嗯。", _meta("balanced", "casual", activated_n=2), "pass"),
+        # 中性 + 引用 3 条（超 max）→ fail
+        ("balanced 引用 3 条 → fail",
+         "嗯。", _meta("balanced", "casual", activated_n=3), "fail"),
+    ]
+
+    for name, reply, meta, expected in cases:
+        total += 1
+        result = _rule_personality_signature(reply, meta)
+        actual = result["status"]
+        passed = actual == expected
+        if check(f"{name} (实际 {actual})", passed):
+            ok += 1
 
     return ok, total
 
@@ -962,6 +1168,115 @@ def test_correction_engine_pure() -> tuple[int, int]:
     return ok, total
 
 
+def test_eval_chat_store() -> tuple[int, int]:
+    """落盘/读盘/列表/删除 + 列表摘要字段。"""
+    import tempfile
+    from pathlib import Path
+
+    print("\n=== 9. eval_chat_store 落盘/读盘 ===")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["EVAL_CHAT_REVIEWS_DIR"] = tmp
+        # 强制重载模块以让 _default_root 重新计算
+        import importlib
+        from app.services import eval_chat_store as ecs
+        importlib.reload(ecs)
+
+        ok = 0
+        total = 0
+        user_id = "u-abc-123"
+        conv_id = "conv_xyz"
+
+        # 1. 落盘 + 读盘
+        pack = {
+            "schema": "chat_audit_v1",
+            "conversation": {"id": conv_id, "title": "t"},
+            "exported_at": "2026-06-07T01:00:00Z",
+            "summary": {"turns_total": 5},
+            "review": {
+                "schema": "eval_review_v1",
+                "evaluable_turns": 5,
+                "final_ok_rate": 0.6,
+                "counters": {
+                    "final_ok": 3, "final_suspicious": 1,
+                    "final_bad": 1, "turns_skipped": 0,
+                },
+            },
+            "turns": [],
+        }
+        path = ecs.save_review(user_id, conv_id, pack)
+        total += 1
+        if check("save_review 写入文件", Path(path).is_file()):
+            ok += 1
+        # 落盘必须 0644（容器以 root 跑时 NFS 端非 root 才能读）
+        mode = Path(path).stat().st_mode & 0o777
+        total += 1
+        if check(f"save_review 文件权限 0644 (实际 0o{mode:o})", mode == 0o644):
+            ok += 1
+
+        loaded = ecs.load_review(user_id, conv_id)
+        total += 1
+        if check("load_review 能读回 + 含 evaluated_at",
+                 loaded is not None and "evaluated_at" in loaded
+                 and loaded["conversation"]["id"] == conv_id):
+            ok += 1
+
+        # 2. 列表摘要
+        items = ecs.list_stored(user_id)
+        total += 1
+        if check(
+            f"list_stored 返回 1 条 (实际 {len(items)})",
+            len(items) == 1 and items[0]["conversation_id"] == conv_id,
+        ):
+            ok += 1
+        first = items[0]
+        total += 1
+        if check(
+            f"list_stored 摘要含 counters (final_ok={first['counters']['final_ok']})",
+            first["counters"]["final_ok"] == 3
+            and first["counters"]["final_bad"] == 1,
+        ):
+            ok += 1
+
+        # 3. 指定 id 查
+        m = ecs.list_stored_for_ids(user_id, [conv_id, "not_exist"])
+        total += 1
+        if check(
+            f"list_stored_for_ids 命中 1 个 (实际 {list(m.keys())})",
+            list(m.keys()) == [conv_id],
+        ):
+            ok += 1
+
+        # 4. 路径穿越被挡掉
+        try:
+            ecs.review_path(user_id, "../../../etc/passwd")
+            blocked = False
+        except ValueError:
+            blocked = True
+        total += 1
+        if check("review_path 挡掉路径穿越", blocked):
+            ok += 1
+
+        # 5. 删除
+        total += 1
+        if check("delete_review 返回 True", ecs.delete_review(user_id, conv_id)):
+            ok += 1
+        total += 1
+        if check(
+            "删除后 load_review 返回 None",
+            ecs.load_review(user_id, conv_id) is None,
+        ):
+            ok += 1
+        total += 1
+        if check(
+            "删除不存在返回 False",
+            ecs.delete_review(user_id, "not_exist") is False,
+        ):
+            ok += 1
+
+        return ok, total
+
+
 def main() -> int:
     print("MindMem P0 自测开始")
     totals = []
@@ -969,11 +1284,13 @@ def main() -> int:
         test_router,
         test_dedupe_and_filter,
         test_prompt_composer,
+        test_personality_signature_rule,
         test_emotional_context_filter,
         test_cap_and_background_buckets,
         test_memory_challenge_pipeline,
         test_chat_review_rules,
         test_correction_engine_pure,
+        test_eval_chat_store,
     ):
         totals.append(fn())
     passed = sum(x for x, _ in totals)

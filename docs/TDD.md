@@ -634,9 +634,12 @@ Memory Router 输出后，Prompt 不再简单拼接完整画像/事件/记忆，
 - ...
 
 【本轮】                                                # 只剩对 LLM 真正有用的最小集
-- 意图：{intent_label}；人格：{persona_tone}
+- 意图：{intent_label}
 - 显性记忆最多 {max_explicit_memories} 条
 - [可选] 敏感场景：承接当下感受，不主动翻旧账
+
+# v1.2.2：人格表达从"【本轮】里一行 persona_tone 描述"统一收敛到 PERSONALITY_CONTRACT
+# 段（intent != knowledge_task 时注入），避免 BASE_PERSONA / TONE / CONTRACT 三处描述打架。
 
 {INTENT_GUIDES[intent]}  # 一次只注入一条；按 intent 选
 
